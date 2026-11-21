@@ -15,6 +15,11 @@
 // A reschedule arrives as adjacent revisions (withdrawal under the old day,
 // insert under the new day). All changes of one source run are published in
 // a single batch, so the withdrawal and the insert become visible together.
+//
+// Charlie's batch unit is one complete upload-window version pass (see
+// syncCharlie): the changes of a single version leave as one batch, and the
+// page journal lets a crashed pass resume at its next page when the upstream
+// version is still readable.
 package collector
 
 import (
@@ -27,6 +32,7 @@ import (
 	"time"
 
 	"estuary-collector/internal/domain"
+	"estuary-collector/internal/journal"
 	"estuary-collector/internal/mockdata"
 	"estuary-collector/internal/normalize"
 	"estuary-collector/internal/source"
@@ -50,6 +56,9 @@ type SourceResult struct {
 	Changes       int    `json:"changes"`
 	BatchID       string `json:"batch_id,omitempty"`
 	CursorRestart bool   `json:"cursor_restart,omitempty"`
+	// WindowRestart counts charlie page passes restarted because the saved
+	// window version was retired before the pass finished.
+	WindowRestart int    `json:"window_restart,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
@@ -60,10 +69,12 @@ type Report struct {
 	Sources   []SourceResult `json:"sources"`
 }
 
-// Engine wires stores, state and the three source clients.
+// Engine wires stores, state, the source clients and the in-progress page
+// journal used to resume half-paged window versions.
 type Engine struct {
 	store   *store.Store
 	states  *state.Store
+	journal *journal.Store
 	alpha   *source.AlphaClient
 	bravo   *source.BravoClient
 	charlie *source.CharlieClient
@@ -80,10 +91,11 @@ type Engine struct {
 }
 
 // New builds an engine and rebuilds the record index from published batches.
-func New(st *store.Store, stt *state.Store, a *source.AlphaClient, b *source.BravoClient, c *source.CharlieClient) (*Engine, error) {
+func New(st *store.Store, stt *state.Store, j *journal.Store, a *source.AlphaClient, b *source.BravoClient, c *source.CharlieClient) (*Engine, error) {
 	e := &Engine{
 		store:   st,
 		states:  stt,
+		journal: j,
 		alpha:   a,
 		bravo:   b,
 		charlie: c,
@@ -122,6 +134,10 @@ func (e *Engine) rebuildIndex() error {
 			}
 		}
 	}
+	// A pass that was interrupted mid-window leaves its partial changes in
+	// the page journal, never in a published batch. The index therefore only
+	// replays what downstream has actually seen; the resumed pass re-applies
+	// the journal's changes when it continues.
 	return nil
 }
 
@@ -367,66 +383,265 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 }
 
 // ---------- charlie: upload-time windows ----------
-
+//
+// Charlie publishes in upload-time windows and every window is itself
+// multi-page. Two anomalies make positional scanning wrong:
+//   - a window can be attached late, with an upload time older than windows
+//     already read (so it sorts before them);
+//   - an already-read window can re-publish revisions in place (append rows,
+//     bump its version), including reschedules of samples from other days.
+//
+// The manifest carries a version per window. A window whose version equals
+// the last fully published version is skipped after the manifest alone is
+// read. Every changed or newly attached window is paged in full, and the
+// changes of one complete window-version pass are published as a single
+// batch. A reschedule's withdrawal and insert therefore stay together, and a
+// batch never mixes two versions or a partially paged window.
+//
+// An interrupted pass keeps its raw records and next offset in the page
+// journal. If the saved version is still readable upstream, the restart
+// continues from that offset and re-derives the union of journaled and new
+// records — the revision index absorbs anything already published, so a crash
+// between batch write and version checkpoint does not duplicate changes. If
+// the saved version was retired, the pass restarts at page zero of the current
+// version so one batch still holds exactly one version's complete pass.
+// Downstream bookmarks are unaffected: batches keep the global monotonic
+// sequence.
 func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 	res.Source = mockdata.InstitutionCharlie
-	pos := e.states.Get(mockdata.InstitutionCharlie)
+	published := e.states.WindowVersions(mockdata.InstitutionCharlie)
 
 	windows, err := e.charlie.FetchWindows(ctx)
 	if err != nil {
 		res.Status, res.Error = classifyError(err)
 		return res
 	}
-	windowIndex := pos.WindowIndex
-	if windowIndex > len(windows) {
-		windowIndex = len(windows)
-	}
-	windowOffset := pos.WindowOffset
-	var changes []domain.Change
-	run := 0
 
-	for windowIndex < len(windows) {
-		window := windows[windowIndex]
-		for {
-			if err := ctx.Err(); err != nil {
-				res.Status, res.Error = "interrupted", err.Error()
-				return res
-			}
-			page, err := e.charlie.FetchWindowPage(ctx, window, windowOffset)
-			if err != nil {
-				res.Status, res.Error = classifyError(err)
-				return res
-			}
-			res.PagesFetched++
-			for _, raw := range page.Records {
-				res.RecordsSeen++
-				ch, derr := e.derive(raw)
-				if derr != nil {
-					res.Status, res.Error = "failed", derr.Error()
-					return res
-				}
-				if ch != nil {
-					changes = append(changes, *ch)
-				}
-			}
-			if e.hookAfterPage != nil {
-				e.hookAfterPage(mockdata.InstitutionCharlie, run, page.Position)
-			}
-			windowOffset = page.Position.WindowOffset
-			run++
-			if page.Done {
-				windowIndex++
-				windowOffset = 0
-				break
-			}
-		}
-	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), changes,
-		state.Position{WindowIndex: windowIndex, WindowOffset: windowOffset})
+	pending, hasPending, err := e.journal.Load(mockdata.InstitutionCharlie)
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	run := 0
+
+	// Resume the interrupted window first. A journal whose version is already
+	// published is stale (the crash hit after the batch and checkpoint but
+	// before the journal clear) and is simply dropped.
+	if hasPending {
+		var current source.Window
+		found := false
+		for _, w := range windows {
+			if w.Window == pending.Window {
+				found, current = true, w
+				break
+			}
+		}
+		if !found || versionPublished(published[pending.Window], pending.Version) {
+			if err := e.journal.Clear(mockdata.InstitutionCharlie); err != nil {
+				res.Status, res.Error = "failed", err.Error()
+				return res
+			}
+			hasPending = false
+		} else {
+			version, restarted, changes, err := e.resumeWindowPass(ctx, current, pending, &run, &res)
+			if err != nil {
+				res.Status, res.Error = classifyError(err)
+				return res
+			}
+			if restarted {
+				res.WindowRestart++
+			}
+			if err := e.publishWindow(current.Window, version, changes, &res); err != nil {
+				res.Status, res.Error = classifyError(err)
+				return res
+			}
+			published[current.Window] = version
+			hasPending = false
+		}
+	}
+
+	for _, w := range windows {
+		if prev, ok := published[w.Window]; ok && prev == w.Version {
+			// Unchanged window: only the manifest needed reading.
+			continue
+		}
+		version, changes, err := e.runWindowPass(ctx, w, &run, &res)
+		if err != nil {
+			res.Status, res.Error = classifyError(err)
+			return res
+		}
+		if err := e.publishWindow(w.Window, version, changes, &res); err != nil {
+			res.Status, res.Error = classifyError(err)
+			return res
+		}
+		published[w.Window] = version
+	}
+
+	res.Status = "ok"
 	return res
+}
+
+// versionPublished reports whether a window's published version already covers
+// the given journal version. A version is monotonic, so anything at or below
+// the published one has already been fully paged and published.
+func versionPublished(publishedVersion, journalVersion int64) bool {
+	return publishedVersion >= journalVersion
+}
+
+// runWindowPass pages a window version from its first row, journaling raw
+// records and progress after every page so a crash resumes at the next page.
+// All pages are read before any change is derived, so the returned changes
+// belong to exactly one complete version pass.
+func (e *Engine) runWindowPass(ctx context.Context, w source.Window, run *int, res *SourceResult) (int64, []domain.Change, error) {
+	version := w.Version
+	offset := 0
+	entry := journal.Entry{Source: mockdata.InstitutionCharlie, Window: w.Window, Version: version}
+	var records []map[string]any
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+		page, err := e.charlie.FetchWindowPage(ctx, w.Window, version, offset)
+		if err != nil {
+			return 0, nil, err
+		}
+		res.PagesFetched++
+		res.RecordsSeen += len(page.Records)
+		records = append(records, page.Records...)
+		offset = page.Position.WindowOffset
+		*run++
+		// Persist page progress before anything can observe the page, so a
+		// restart always continues at the next page and never publishes a
+		// partial version.
+		entry.Offset = offset
+		entry.Records = records
+		if err := e.journal.Save(entry); err != nil {
+			return 0, nil, err
+		}
+		if e.hookAfterPage != nil {
+			e.hookAfterPage(mockdata.InstitutionCharlie, *run-1, page.Position)
+		}
+		if page.Done {
+			break
+		}
+	}
+	changes, err := e.deriveRecords(records)
+	if err != nil {
+		return 0, nil, err
+	}
+	return version, changes, nil
+}
+
+// resumeWindowPass continues a journaled pass. It returns the version read in
+// full, whether the saved version had to be abandoned, and the changes
+// derived from the complete pass.
+func (e *Engine) resumeWindowPass(ctx context.Context, w source.Window, pending *journal.Entry, run *int, res *SourceResult) (int64, bool, []domain.Change, error) {
+	version := pending.Version
+	offset := pending.Offset
+	records := append([]map[string]any(nil), pending.Records...)
+	restarted := false
+	entry := *pending
+
+	// Discard a retired version's partial reading and begin the current
+	// version from its first page.
+	restartAt := func(newVersion int64) error {
+		restarted = true
+		version = newVersion
+		offset = 0
+		records = nil
+		entry.Version = version
+		entry.Offset = 0
+		entry.Records = nil
+		return e.journal.Save(entry)
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, restarted, nil, err
+		}
+		page, err := e.charlie.FetchWindowPage(ctx, w.Window, version, offset)
+		if err != nil {
+			var expired *source.WindowVersionExpiredError
+			if !errors.As(err, &expired) {
+				return 0, restarted, nil, err
+			}
+			if err := restartAt(w.Version); err != nil {
+				return 0, restarted, nil, err
+			}
+			continue
+		}
+		// The server reports the version it actually served. If it differs
+		// from the pinned version, the snapshot was retired between the
+		// manifest read and this page; restart the pass at the current
+		// version instead of mixing versions in one batch.
+		if version != 0 && page.Position.WindowVersion != version {
+			if err := restartAt(page.Position.WindowVersion); err != nil {
+				return 0, restarted, nil, err
+			}
+			continue
+		}
+		if version == 0 {
+			version = page.Position.WindowVersion
+			entry.Version = version
+		}
+		res.PagesFetched++
+		res.RecordsSeen += len(page.Records)
+		records = append(records, page.Records...)
+		offset = page.Position.WindowOffset
+		*run++
+		entry.Offset = offset
+		entry.Records = records
+		if err := e.journal.Save(entry); err != nil {
+			return 0, restarted, nil, err
+		}
+		if e.hookAfterPage != nil {
+			e.hookAfterPage(mockdata.InstitutionCharlie, *run-1, page.Position)
+		}
+		if page.Done {
+			break
+		}
+	}
+	changes, err := e.deriveRecords(records)
+	if err != nil {
+		return 0, restarted, nil, err
+	}
+	return version, restarted, changes, nil
+}
+
+// deriveRecords turns one complete version pass into changes against the
+// revision index. Stale or already-published revisions produce nothing.
+func (e *Engine) deriveRecords(records []map[string]any) ([]domain.Change, error) {
+	changes := make([]domain.Change, 0, len(records))
+	for _, raw := range records {
+		ch, err := e.derive(raw)
+		if err != nil {
+			return nil, err
+		}
+		if ch != nil {
+			changes = append(changes, *ch)
+		}
+	}
+	return changes, nil
+}
+
+// publishWindow emits one batch for one completely paged window version and
+// then durably records that version, in that order. A crash after the batch
+// but before the version record only re-pages the window; the revision index
+// absorbs replayed changes, so nothing is duplicated and nothing is lost.
+func (e *Engine) publishWindow(window string, version int64, changes []domain.Change, res *SourceResult) error {
+	if len(changes) > 0 {
+		env, err := e.store.Publish(e.newBatchID(mockdata.InstitutionCharlie, 0), changes)
+		if err != nil {
+			return fmt.Errorf("publish charlie window %s: %w", window, err)
+		}
+		res.BatchID = env.BatchID
+	}
+	res.Changes += len(changes)
+	if err := e.states.SetWindowVersion(mockdata.InstitutionCharlie, window, version); err != nil {
+		return fmt.Errorf("save charlie window version: %w", err)
+	}
+	if err := e.journal.Clear(mockdata.InstitutionCharlie); err != nil {
+		return fmt.Errorf("clear journal: %w", err)
+	}
+	return nil
 }

@@ -22,15 +22,23 @@ type Position struct {
 	Cursor string `json:"cursor,omitempty"`
 	// Cursor source: last seen log offset, used for stats only.
 	CursorOffset int `json:"cursor_offset,omitempty"`
-	// Window source (charlie): index of the current upload window...
+	// WindowIndex is kept for compatibility with older state files. Window
+	// positions are now identity/version based (see File.Windows); positional
+	// indexing cannot handle windows that are attached late or revised in
+	// place.
+	//
+	// Deprecated: window positions live in File.Windows.
 	WindowIndex int `json:"window_index,omitempty"`
-	// ...and the next row offset inside that window.
-	WindowOffset int `json:"window_offset,omitempty"`
 }
 
 // File is the on-disk state container.
 type File struct {
 	Positions map[string]Position `json:"positions"`
+	// Windows records, per source, the manifest version of every window whose
+	// latest complete page pass has been published. A window is skipped after
+	// the manifest alone when its upstream version still matches; a newer
+	// version means the window must be paged again in full.
+	Windows map[string]map[string]int64 `json:"windows,omitempty"`
 }
 
 // Store is a mutex-protected JSON file updated atomically via temp+rename.
@@ -45,7 +53,10 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{path: filepath.Join(dir, "state.json"), file: File{Positions: map[string]Position{}}}
+	s := &Store{path: filepath.Join(dir, "state.json"), file: File{
+		Positions: map[string]Position{},
+		Windows:   map[string]map[string]int64{},
+	}}
 	b, err := os.ReadFile(s.path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -60,6 +71,9 @@ func Open(dir string) (*Store, error) {
 	}
 	if s.file.Positions == nil {
 		s.file.Positions = map[string]Position{}
+	}
+	if s.file.Windows == nil {
+		s.file.Windows = map[string]map[string]int64{}
 	}
 	return s, nil
 }
@@ -76,6 +90,33 @@ func (s *Store) Update(source string, pos Position) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.file.Positions[source] = pos
+	return s.flushLocked()
+}
+
+// WindowVersions returns the published manifest versions of a source's
+// windows. The returned map is a copy and safe to mutate.
+func (s *Store) WindowVersions(source string) map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int64, len(s.file.Windows[source]))
+	for k, v := range s.file.Windows[source] {
+		out[k] = v
+	}
+	return out
+}
+
+// SetWindowVersion records the published version of one window and flushes
+// the file atomically.
+func (s *Store) SetWindowVersion(source, window string, version int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.file.Windows == nil {
+		s.file.Windows = map[string]map[string]int64{}
+	}
+	if s.file.Windows[source] == nil {
+		s.file.Windows[source] = map[string]int64{}
+	}
+	s.file.Windows[source][window] = version
 	return s.flushLocked()
 }
 

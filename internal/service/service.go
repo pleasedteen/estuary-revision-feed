@@ -10,6 +10,7 @@ import (
 
 	"estuary-collector/internal/auth"
 	"estuary-collector/internal/collector"
+	"estuary-collector/internal/journal"
 	"estuary-collector/internal/mockserver"
 	"estuary-collector/internal/source"
 	"estuary-collector/internal/state"
@@ -48,7 +49,12 @@ func New(cfg Config) (*Service, error) {
 	bravo := source.NewBravo(cfg.MockBaseURL, cfg.BravoToken)
 	charlie := source.NewCharlie(cfg.MockBaseURL, tokens)
 
-	engine, err := collector.New(batch, states, alpha, bravo, charlie)
+	jnl, err := journal.Open(cfg.DataDir + "/state")
+	if err != nil {
+		return nil, err
+	}
+
+	engine, err := collector.New(batch, states, jnl, alpha, bravo, charlie)
 	if err != nil {
 		return nil, err
 	}

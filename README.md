@@ -11,7 +11,7 @@
 |------|----------|------|----------|
 | alpha | 偏移分页 `offset/limit` | 共享短期令牌 | 新格式 |
 | bravo | 不透明游标分页，过期后需从头回读（会重放旧修订） | 静态 Bearer | 旧格式 |
-| charlie | 上传时间窗 + 窗内多页 | 共享短期令牌 | 新格式 |
+| charlie | 上传时间窗 + 窗内多页；窗口带版本，可补挂旧窗口、原地改版 | 共享短期令牌 | 新格式 |
 
 alpha 与 charlie **共用同一代短期访问令牌**：一代令牌失效后，采集服务对认证端
 **只发起一次刷新**，并发的 401 调用合并等待同一次刷新结果（见
@@ -28,12 +28,13 @@ internal/mockdata    可复现的分阶段数据集（修订/改期/撤回/旧�
 internal/mockserver  模拟 HTTP 接口（三种分页、401/410/429、控制端点）
 internal/auth        共享令牌管理器（单飞刷新，同代只刷一次）
 internal/source      三个来源的 HTTP 客户端（401 重试、429/410 分类错误）
-internal/state       每来源读取位置，原子写盘，支持断点续传
+internal/state       每来源读取位置，原子写盘，支持断点续传（含 charlie 窗口版本清单）
+internal/journal     窗内分页的页级进度日志（原始记录 + 下一页偏移），供崩溃后续页
 internal/store       JSON Lines 批次存储：全局 seq、原子追加、按位置续读
-internal/collector   采集引擎：修订判定、撤回防复活、改期同批、崩溃恢复
+internal/collector   采集引擎：修订判定、撤回防复活、改期同批、窗口版本化、崩溃恢复
 internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status）
-tests                端到端测试（11 个场景 + HTTP 层测试）
-scripts/verify.sh    一条命令完成的可复现验证（约 3 秒）
+tests                端到端测试（14 个场景 + HTTP 层测试）
+scripts/verify.sh    一条命令完成的可复现验证（约 5 秒）
 ```
 
 ## 快速开始
@@ -89,10 +90,17 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 curl -X POST http://127.0.0.1:18081/mock/control/stage     # 推进一个数据阶段
 curl -X POST "http://127.0.0.1:18081/mock/control/ratelimit?source=alpha&on=true"
 curl -X POST http://127.0.0.1:18081/mock/control/reset      # 全部复位
-curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等
+curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等（含窗口清单与清单/取页计数）
+
+# 以原始记录追加到 charlie 窗口（窗口版本 +1，等价于“旧窗口原地改版”）
+curl -X POST http://127.0.0.1:18081/mock/control/charlie/append \
+  -d '{"window":"2026-11-10T00:00:00Z","records":[{"institution":"charlie","sample_id":"C-300","rev":2,"sampled_on":"2026-11-10","site":"河口东","substance":"悬浮物","concentration":"9.8","unit":"mg/L","status":"active","published_at":"2026-11-13T01:00:00Z"}]}'
+# 让某窗口的旧版本快照失效（模拟窗口改版后旧版本已不可续读）
+curl -X POST http://127.0.0.1:18081/mock/control/charlie/expire \
+  -d '{"window":"2026-11-10T00:00:00Z"}'
 ```
 
-## 一条命令的可复现验证（目标 80 秒内，实测约 3 秒）
+## 一条命令的可复现验证（目标 80 秒内，实测约 5 秒）
 
 ```bash
 scripts/verify.sh
@@ -100,8 +108,9 @@ scripts/verify.sh
 
 脚本会构建二进制、运行全部 Go 测试（核心包带 `-race`），再通过真实 HTTP 接口
 依次演示：三种分页首轮采集、新旧格式与 `g/m³ → mg/L` 统一、修订/撤回/改期同批、
-幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、崩溃后续跑以及下游
-按保存位置续读。依赖安装时间不计入。
+幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、Charlie 补挂旧窗口
+与旧窗口原地改版（未变化窗口只查清单、不取页）、崩溃后续跑以及下游按保存位置
+续读。依赖安装时间不计入。
 
 只跑 Go 测试：
 
@@ -129,7 +138,20 @@ go test -race ./...      # 含竞态检测
 改期在数据上表现为相邻的两条修订：旧日的 `withdrawn` 与新日的 `upsert`。
 单个来源一轮内的所有变更**收集后一次性发布为一个批次**（一个 JSONL 信封），
 因此撤除与补入对外同时可见，不会出现只删未补的中间态。
-对应测试：`Test4_RescheduleAtomic`。
+对 charlie 而言，这个“一次性发布”的单位是一个**完整取完的窗口版本**：同一窗口
+版本的撤除与补入必然在同一批次里，批次也绝不会混入另一个版本或只取了一半的窗口。
+对应测试：`Test4_RescheduleAtomic`、`Test12_CharlieLateAndRevisedWindows`。
+
+### 3.1 Charlie 窗口：补挂旧窗口、原地改版与只查清单
+
+charlie 的窗口清单带版本号（`window` + `version` + `row_count`），采集器据此：
+
+- **每次同步都重读清单**，因此新开窗口、以及上传时间早于已读窗口的**补挂旧窗口**
+  （排序后落在已读位置之前）都会被完整取页；位置不再用窗口序号，而用窗口标识。
+- 某窗口版本与已发布版本一致 → **只查清单、不取任何行**（未变化窗口零取页）。
+- 版本变高（旧窗口原地追加了修订/改期/撤回）→ 该窗口**从头完整重取**，
+  变更仍按修订号去重，未变化的行不会产生变更。
+对应测试：`Test12_CharlieLateAndRevisedWindows`（含“未变化窗口零取页”断言）。
 
 ### 4. 新旧格式与单位统一
 
@@ -145,7 +167,13 @@ go test -race ./...      # 含竞态检测
   恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
 - 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
   `seq > after_seq`，文件轮转不影响旧位置。
-对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
+- charlie 窗内分页例外地以整个窗口版本为发布单位：取页中途把已读原始记录与下一页
+  偏移写入 `state/journal.json`。重启时若该版本上游仍可读，就**从下一页接着取**，
+  已读页不会重取；若该旧版本已被上游收回，则从当前版本的首页重取，保证一个批次
+  仍只包含同一版本的完整取页。发布批次后再记窗口版本，崩溃最多导致重取（修订号
+  去重使变更不重复），不会丢变更。
+对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`、
+`Test13_CharlieInterruptResumeSameVersion`、`Test14_CharlieVersionRetiredRestartsWindow`。
 
 ### 6. 限流隔离与令牌刷新
 

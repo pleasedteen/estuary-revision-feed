@@ -66,6 +66,24 @@ func (h *harness) advanceStage() {
 	h.mock.Provider.Advance()
 }
 
+// restart rebuilds the collector process from on-disk state, keeping the
+// mock server and the published batches in place.
+func (h *harness) restart() {
+	h.t.Helper()
+	svc, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		h.t.Fatalf("restart service: %v", err)
+	}
+	h.svc = svc
+}
+
 func (h *harness) mockPost(path string, body any) map[string]any {
 	h.t.Helper()
 	var buf bytes.Buffer
@@ -94,6 +112,26 @@ func (h *harness) mockGet(path string) map[string]any {
 		h.t.Fatalf("decode %s: %v", path, err)
 	}
 	return out
+}
+
+// maxSeq returns the current highest published sequence.
+func (h *harness) maxSeq() int64 {
+	h.t.Helper()
+	st, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return st.MaxSeq()
+}
+
+// charlieRow builds one raw charlie record for mock control appends.
+func charlieRow(sample string, rev int64, day, mgPerL string) map[string]any {
+	return map[string]any{
+		"institution": "charlie", "sample_id": sample, "rev": rev,
+		"sampled_on": day, "site": "河口东", "substance": "悬浮物",
+		"concentration": mgPerL, "unit": "mg/L", "status": "active",
+		"published_at": "2026-11-16T01:00:00Z",
+	}
 }
 
 func (h *harness) batchesAfter(seq int64) []map[string]any {
@@ -680,6 +718,257 @@ func max(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// Test12_CharlieLateAndRevisedWindows covers a late-attached window whose
+// upload time sorts before windows already read, and existing windows that
+// re-publish revisions in place. Every newly attached and every re-versioned
+// window must be fully collected, while unchanged windows are skipped after
+// only reading the manifest.
+func Test12_CharlieLateAndRevisedWindows(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+
+	// Two stages apply: the 2026-11-12 window opens, then 2026-11-09 (older
+	// than every existing window) is attached late and the already-read
+	// 2026-11-10 window re-publishes revisions in place (a plain revision
+	// plus a reschedule of C-302 from 2026-11-10 to 2026-11-13).
+	h.advanceStage()
+	h.advanceStage()
+	rep := h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" {
+			t.Fatalf("stage-1 sync source %s failed: %+v", r.Source, r)
+		}
+	}
+
+	recs := materializedMap(h)
+	for _, key := range []string{
+		"charlie|C-290|2026-11-09", // late-attached window, sorts first
+		"charlie|C-291|2026-11-09",
+		"charlie|C-300|2026-11-10", // revised in place
+		"charlie|C-302|2026-11-13", // rescheduled inside an already-read window
+		"charlie|C-307|2026-11-12", // window opened in this stage
+	} {
+		if _, ok := recs[key]; !ok {
+			t.Errorf("expected %s visible after stage 1", key)
+		}
+	}
+	if _, gone := recs["charlie|C-302|2026-11-10"]; gone {
+		t.Fatal("C-302 old archive day still visible after reschedule")
+	}
+	if recs["charlie|C-300|2026-11-10"]["revision"].(float64) != 2 {
+		t.Fatalf("C-300 should be at revision 2: %v", recs["charlie|C-300|2026-11-10"])
+	}
+
+	// The in-place reschedule halves must share one batch: a batch is one
+	// complete window-version pass.
+	for _, env := range h.batchesAfter(0) {
+		hasOld, hasNew := false, false
+		for _, c := range env["changes"].([]any) {
+			cm := c.(map[string]any)
+			if cm["institution"] != "charlie" || cm["sample_id"] != "C-302" {
+				continue
+			}
+			if cm["op"] == "withdraw" && cm["sampled_on"] == "2026-11-10" {
+				hasOld = true
+			}
+			if cm["op"] == "upsert" && cm["sampled_on"] == "2026-11-13" {
+				hasNew = true
+			}
+		}
+		if hasOld != hasNew {
+			t.Fatalf("charlie C-302 reschedule split across batches: envelope %v", env["batch_id"])
+		}
+	}
+
+	// Unchanged windows are skipped after the manifest: the following sync
+	// must read the manifest but fetch no rows at all.
+	before := h.mockGet("/mock/stats")
+	h.sync()
+	after := h.mockGet("/mock/stats")
+	manifest := after["charlie_manifest_calls"].(float64) - before["charlie_manifest_calls"].(float64)
+	pages := after["charlie_page_calls"].(float64) - before["charlie_page_calls"].(float64)
+	if manifest < 1 {
+		t.Fatalf("expected at least one manifest read, got %v", manifest)
+	}
+	if pages != 0 {
+		t.Fatalf("unchanged windows fetched %v pages, want 0", pages)
+	}
+
+	// The next stage revises another already-read window in place.
+	h.advanceStage()
+	rep = h.sync()
+	if r := sourceResult(rep, mockdata.InstitutionCharlie); r.Status != "ok" {
+		t.Fatalf("stage-2 charlie failed: %+v", r)
+	}
+	recs = materializedMap(h)
+	if recs["charlie|C-303|2026-11-11"]["revision"].(float64) != 2 {
+		t.Fatalf("C-303 should be revision 2: %v", recs["charlie|C-303|2026-11-11"])
+	}
+}
+
+// Test13_CharlieInterruptResumeSameVersion makes a window grow to three pages,
+// crashes after its second page while the saved version is still readable, and
+// verifies the restart continues at the saved page instead of re-fetching the
+// earlier ones. No change is published twice and old downstream bookmarks
+// still read normally.
+func Test13_CharlieInterruptResumeSameVersion(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	savedSeq := h.maxSeq()
+
+	// Grow the 2026-11-11 window from 4 to 7 rows: three pages of two.
+	appendRows := []map[string]any{
+		charlieRow("C-308", 1, "2026-11-11", "6.2"),
+		charlieRow("C-309", 1, "2026-11-11", "9.6"),
+		charlieRow("C-310", 1, "2026-11-11", "13.4"),
+	}
+	h.mockPost("/mock/control/charlie/append", map[string]any{
+		"window": "2026-11-11T00:00:00Z", "records": appendRows,
+	})
+
+	var charliePages atomic.Int64
+	var crash sync.Once
+	h.svc.Engine.SetPageHook(func(src string, _ int, _ source.Next) {
+		if src != mockdata.InstitutionCharlie {
+			return
+		}
+		if charliePages.Add(1) == 2 {
+			crash.Do(func() { panic("simulated crash mid-window") })
+		}
+	})
+	before := h.mockGet("/mock/stats")
+	crashPagesBefore := before["charlie_page_calls"].(float64)
+	func() {
+		defer func() { _ = recover() }()
+		h.sync()
+	}()
+	h.svc.Engine.SetPageHook(nil)
+
+	// Restart the process; the journal and state are on disk.
+	h.restart()
+
+	// Record the next offset reported by the first page of the resumed run;
+	// it must be 6 (the page read started at row 4), not 2.
+	var firstResumeNext atomic.Int64
+	firstResumeNext.Store(-1)
+	h.svc.Engine.SetPageHook(func(src string, _ int, next source.Next) {
+		if src == mockdata.InstitutionCharlie {
+			firstResumeNext.CompareAndSwap(-1, int64(next.WindowOffset))
+		}
+	})
+	before = h.mockGet("/mock/stats")
+	pagesBefore := before["charlie_page_calls"].(float64)
+	rep := h.sync()
+	h.svc.Engine.SetPageHook(nil)
+	if r := sourceResult(rep, mockdata.InstitutionCharlie); r.Status != "ok" {
+		t.Fatalf("resume charlie failed: %+v", r)
+	}
+	after := h.mockGet("/mock/stats")
+	pagesAfter := after["charlie_page_calls"].(float64)
+	crashPages := pagesBefore - crashPagesBefore
+	// The grown window has 7 rows in pages of 2: offsets 0,2,4,6. The crash
+	// hit after page two (offset 2), so the resume continues at offset 4 and
+	// reads the remaining two pages, never the first two.
+	if crashPages != 2 {
+		t.Fatalf("crash run read %v pages, expected 2", crashPages)
+	}
+	if used := pagesAfter - pagesBefore; used != 2 {
+		t.Fatalf("resume read %v pages, expected the 2 remaining", used)
+	}
+	if got := firstResumeNext.Load(); got != 6 {
+		t.Fatalf("resumed run's first page ended at offset %d, expected 6 (page read started at row 4)", got)
+	}
+	if r := sourceResult(rep, mockdata.InstitutionCharlie); r.WindowRestart != 0 {
+		t.Fatalf("readable version should not be restarted: %+v", r)
+	}
+
+	// The three new rows are published exactly once, the old 22 remain.
+	changes := 0
+	for _, c := range allChanges(t, h) {
+		if c["institution"] == "charlie" {
+			changes++
+		}
+	}
+	if changes != 10 {
+		t.Fatalf("expected 7 base + 3 new charlie changes, got %d", changes)
+	}
+	if got := len(h.svc.Engine.Materialized()); got != 25 {
+		t.Fatalf("expected 25 materialized records, got %d", got)
+	}
+
+	// A bookmark taken before the crash still sees every later batch.
+	late := h.batchesAfter(savedSeq)
+	if len(late) == 0 {
+		t.Fatal("downstream position from before the crash saw no new batches")
+	}
+}
+
+// Test14_CharlieVersionRetiredRestartsWindow crashes mid-window, then retires
+// the saved version so the restart must begin the window again from its first
+// page under the current version, still yielding one complete version per
+// batch and exactly one published change per record.
+func Test14_CharlieVersionRetiredRestartsWindow(t *testing.T) {
+	h := newHarness(t)
+	var charliePages atomic.Int64
+	var crash sync.Once
+	h.svc.Engine.SetPageHook(func(src string, _ int, _ source.Next) {
+		if src != mockdata.InstitutionCharlie {
+			return
+		}
+		if charliePages.Add(1) == 2 {
+			crash.Do(func() { panic("simulated crash mid-window") })
+		}
+	})
+	func() {
+		defer func() { _ = recover() }()
+		h.sync()
+	}()
+	h.svc.Engine.SetPageHook(nil)
+
+	// The window's next version is published and its older snapshot retired.
+	h.mockPost("/mock/control/charlie/append", map[string]any{
+		"window": "2026-11-10T00:00:00Z",
+		"records": []map[string]any{{
+			"institution": "charlie", "sample_id": "C-300", "rev": 2,
+			"sampled_on": "2026-11-10", "site": "河口东", "substance": "悬浮物",
+			"concentration": "9.8", "unit": "mg/L", "status": "active",
+			"published_at": "2026-11-13T01:00:00Z",
+		}},
+	})
+	h.mockPost("/mock/control/charlie/expire", map[string]any{"window": "2026-11-10T00:00:00Z"})
+	h.restart()
+
+	rep := h.sync()
+	cr := sourceResult(rep, mockdata.InstitutionCharlie)
+	if cr.Status != "ok" {
+		t.Fatalf("resume charlie failed: %+v", cr)
+	}
+	if cr.WindowRestart < 1 {
+		t.Fatalf("expected a reported window restart, got %+v", cr)
+	}
+	recs := materializedMap(h)
+	if len(recs) != 22 {
+		t.Fatalf("expected 22 materialized records, got %d", len(recs))
+	}
+	if recs["charlie|C-300|2026-11-10"]["mg_per_l"] != "9.8" {
+		t.Fatalf("revised C-300 not applied: %v", recs["charlie|C-300|2026-11-10"])
+	}
+	// Each charlie revision is published at most once: the crash between
+	// pages must never cause a change to be emitted twice.
+	counts := map[string]int{}
+	for _, c := range allChanges(t, h) {
+		if c["institution"] == "charlie" {
+			k := fmt.Sprintf("%v|%v|%v", c["sample_id"], c["sampled_on"], c["revision"])
+			counts[k]++
+		}
+	}
+	for k, n := range counts {
+		if n > 1 {
+			t.Fatalf("charlie change %s published %d times", k, n)
+		}
+	}
 }
 
 // TestHTTPLayer exercises the real HTTP mux including conflict and

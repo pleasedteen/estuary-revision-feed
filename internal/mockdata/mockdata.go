@@ -6,6 +6,13 @@
 // Stages are advanced explicitly through the mock control API so that test
 // scenarios (revision, reschedule, withdrawal, stale-revision resurrection
 // attempt) are fully reproducible.
+//
+// Charlie is special: its upload windows are versioned. A window can be
+// attached late (even with an upload time older than already-read windows),
+// and an existing window can publish new or re-scheduled revisions in place
+// by appending rows and bumping its version. Every version is retained as a
+// readable snapshot until it is explicitly expired, which lets a collector
+// that was interrupted mid-page resume at the next page of the same version.
 package mockdata
 
 import (
@@ -26,6 +33,22 @@ const (
 	PageLimitCharlie = 2
 )
 
+// WindowMeta is one entry of the charlie window manifest. Version changes
+// whenever the window's rows are appended to, so an unchanged window can be
+// skipped after reading the manifest alone.
+type WindowMeta struct {
+	Window   string `json:"window"`
+	Version  int64  `json:"version"`
+	RowCount int    `json:"row_count"`
+}
+
+// charlieWindow keeps the current rows and a readable snapshot per version.
+type charlieWindow struct {
+	version   int64
+	rows      []map[string]any
+	snapshots map[int64][]map[string]any
+}
+
 // Provider is the in-memory, stage-driven source of all mock responses.
 type Provider struct {
 	mu sync.RWMutex
@@ -36,13 +59,14 @@ type Provider struct {
 	alpha []map[string]any
 	// bravo is an append-only revision log read by opaque cursors.
 	bravo []map[string]any
-	// charlie groups rows by upload window; windows are returned in order.
-	charlie map[string][]map[string]any
+	// charlie groups rows by upload window; windows are returned in order
+	// and carry a version that changes when rows are appended.
+	charlie map[string]*charlieWindow
 }
 
 // NewProvider builds the stage-0 dataset.
 func NewProvider() *Provider {
-	p := &Provider{charlie: map[string][]map[string]any{}}
+	p := &Provider{charlie: map[string]*charlieWindow{}}
 	p.resetLocked()
 	return p
 }
@@ -65,19 +89,18 @@ func (p *Provider) resetLocked() {
 	p.stage = 0
 	p.alpha = stage0Alpha()
 	p.bravo = stage0Bravo()
-	p.charlie = map[string][]map[string]any{
-		"2026-11-10T00:00:00Z": {
-			newRow("charlie", "C-300", 1, "2026-11-10", "河口东", "悬浮物", "9.4", "mg/L", "active", "2026-11-10T01:00:00Z"),
-			newRow("charlie", "C-301", 1, "2026-11-10", "河口东", "悬浮物", "11.2", "mg/L", "active", "2026-11-10T01:05:00Z"),
-			newRow("charlie", "C-302", 1, "2026-11-10", "河口西", "悬浮物", "7.7", "g/m3", "active", "2026-11-10T01:10:00Z"),
-		},
-		"2026-11-11T00:00:00Z": {
-			newRow("charlie", "C-303", 1, "2026-11-11", "河口西", "悬浮物", "6.1", "mg/L", "active", "2026-11-11T02:00:00Z"),
-			newRow("charlie", "C-304", 1, "2026-11-11", "浮标1", "悬浮物", "14.8", "mg/L", "active", "2026-11-11T02:05:00Z"),
-			newRow("charlie", "C-305", 1, "2026-11-11", "浮标1", "悬浮物", "10.0", "g/m3", "active", "2026-11-11T02:10:00Z"),
-			newRow("charlie", "C-306", 1, "2026-11-11", "浮标2", "悬浮物", "5.5", "mg/L", "active", "2026-11-11T02:15:00Z"),
-		},
-	}
+	p.charlie = map[string]*charlieWindow{}
+	p.putWindowLocked("2026-11-10T00:00:00Z", 1,
+		newRow("charlie", "C-300", 1, "2026-11-10", "河口东", "悬浮物", "9.4", "mg/L", "active", "2026-11-10T01:00:00Z"),
+		newRow("charlie", "C-301", 1, "2026-11-10", "河口东", "悬浮物", "11.2", "mg/L", "active", "2026-11-10T01:05:00Z"),
+		newRow("charlie", "C-302", 1, "2026-11-10", "河口西", "悬浮物", "7.7", "g/m3", "active", "2026-11-10T01:10:00Z"),
+	)
+	p.putWindowLocked("2026-11-11T00:00:00Z", 1,
+		newRow("charlie", "C-303", 1, "2026-11-11", "河口西", "悬浮物", "6.1", "mg/L", "active", "2026-11-11T02:00:00Z"),
+		newRow("charlie", "C-304", 1, "2026-11-11", "浮标1", "悬浮物", "14.8", "mg/L", "active", "2026-11-11T02:05:00Z"),
+		newRow("charlie", "C-305", 1, "2026-11-11", "浮标1", "悬浮物", "10.0", "g/m3", "active", "2026-11-11T02:10:00Z"),
+		newRow("charlie", "C-306", 1, "2026-11-11", "浮标2", "悬浮物", "5.5", "mg/L", "active", "2026-11-11T02:15:00Z"),
+	)
 }
 
 // Advance applies the next deterministic stage and returns the new number.
@@ -89,13 +112,13 @@ func (p *Provider) Advance() int {
 	case 0:
 		p.alpha = append(p.alpha, stage1Alpha()...)
 		p.bravo = append(p.bravo, stage1Bravo()...)
-		p.charlie["2026-11-12T00:00:00Z"] = []map[string]any{
+		p.appendWindowLocked("2026-11-12T00:00:00Z",
 			// Reschedule of C-301: old-day withdrawal and new-day insert are
 			// adjacent revisions and must leave in the same batch.
 			newRow("charlie", "C-301", 2, "2026-11-10", "河口东", "悬浮物", "11.2", "mg/L", "withdrawn", "2026-11-12T03:00:00Z"),
 			newRow("charlie", "C-301", 3, "2026-11-14", "河口东", "悬浮物", "11.2", "mg/L", "active", "2026-11-12T03:00:01Z"),
 			newRow("charlie", "C-307", 1, "2026-11-12", "浮标2", "悬浮物", "8.9", "mg/L", "active", "2026-11-12T03:05:00Z"),
-		}
+		)
 	case 1:
 		p.alpha = append(p.alpha,
 			newRow("alpha", "A-102", 2, "2026-11-11", "北滩", "悬浮物", "16.3", "g/m3", "active", "2026-11-13T09:00:00Z"),
@@ -105,12 +128,30 @@ func (p *Provider) Advance() int {
 		p.bravo = append(p.bravo,
 			oldRow("bravo", "B-201", 1, "2026-11-10", "南港", "悬浮物", "10.5", "g/m3", "A", "2026-11-10T10:00:00Z"),
 		)
+		// A window with an upload time older than every existing window is
+		// attached late; it sorts before the windows already read.
+		p.appendWindowLocked("2026-11-09T00:00:00Z",
+			newRow("charlie", "C-290", 1, "2026-11-09", "河口东", "悬浮物", "12.0", "mg/L", "active", "2026-11-09T01:00:00Z"),
+			newRow("charlie", "C-291", 1, "2026-11-09", "河口西", "悬浮物", "8.6", "mg/L", "active", "2026-11-09T01:05:00Z"),
+		)
+		// An already-read window re-publishes revisions in place: a plain
+		// revision plus a reschedule whose withdrawal and insert must still
+		// share one batch.
+		p.appendWindowLocked("2026-11-10T00:00:00Z",
+			newRow("charlie", "C-300", 2, "2026-11-10", "河口东", "悬浮物", "9.8", "mg/L", "active", "2026-11-13T01:00:00Z"),
+			newRow("charlie", "C-302", 2, "2026-11-10", "河口西", "悬浮物", "7.7", "g/m3", "withdrawn", "2026-11-13T01:05:00Z"),
+			newRow("charlie", "C-302", 3, "2026-11-13", "河口西", "悬浮物", "7.7", "g/m3", "active", "2026-11-13T01:05:01Z"),
+		)
 	case 2:
 		p.alpha = append(p.alpha,
 			newRow("alpha", "A-105", 2, "2026-11-11", "北滩", "悬浮物", "21.7", "mg/L", "active", "2026-11-15T09:00:00Z"),
 		)
 		p.bravo = append(p.bravo,
 			oldRow("bravo", "B-200", 2, "2026-11-10", "南港", "悬浮物", "6.8", "mg/L", "A", "2026-11-15T10:00:00Z"),
+		)
+		// Another existing window is revised in place.
+		p.appendWindowLocked("2026-11-11T00:00:00Z",
+			newRow("charlie", "C-303", 2, "2026-11-11", "河口西", "悬浮物", "6.5", "mg/L", "active", "2026-11-15T02:00:00Z"),
 		)
 	}
 	p.stage++
@@ -146,8 +187,9 @@ func (p *Provider) BravoPage(offset, limit int) (rows []map[string]any, nextOffs
 	return slicePage(p.bravo, offset, limit)
 }
 
-// CharlieWindows returns the ordered upload windows and their row counts.
-func (p *Provider) CharlieWindows() []map[string]any {
+// CharlieWindows returns the ordered upload windows and their current
+// versions and row counts.
+func (p *Provider) CharlieWindows() []WindowMeta {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	keys := make([]string, 0, len(p.charlie))
@@ -155,26 +197,88 @@ func (p *Provider) CharlieWindows() []map[string]any {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	out := make([]map[string]any, 0, len(keys))
+	out := make([]WindowMeta, 0, len(keys))
 	for _, k := range keys {
-		out = append(out, map[string]any{
-			"window":    k,
-			"row_count": len(p.charlie[k]),
-		})
+		w := p.charlie[k]
+		out = append(out, WindowMeta{Window: k, Version: w.version, RowCount: len(w.rows)})
 	}
 	return out
 }
 
-// CharliePage returns one page inside an upload window.
-func (p *Provider) CharliePage(window string, offset, limit int) (rows []map[string]any, next int, ok bool) {
+// CharliePage returns one page inside an upload window version. A version of
+// zero means the window's current version. The returned servedVersion is the
+// version actually read, so a caller pinned to an older but still readable
+// version can keep paging it. readable is false when the requested version
+// has been expired. ok is false when the window is unknown.
+func (p *Provider) CharliePage(window string, version int64, offset, limit int) (rows []map[string]any, next int, hasMore bool, servedVersion int64, ok, readable bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	all, ok := p.charlie[window]
-	if !ok {
-		return nil, offset, false
+	w, found := p.charlie[window]
+	if !found {
+		return nil, offset, false, 0, false, false
+	}
+	if version == 0 {
+		version = w.version
+	}
+	all, readable := w.snapshots[version]
+	if !readable {
+		return nil, offset, false, 0, true, false
 	}
 	rows, next = slicePage(all, offset, limit)
-	return rows, next, true
+	return rows, next, next < len(all), version, true, true
+}
+
+// CharlieAppend appends rows to an existing window (or creates it when
+// allowCreate is set) and bumps its version. Every append produces a new
+// readable snapshot, modelling a window that re-publishes revisions in place.
+func (p *Provider) CharlieAppend(window string, rows []map[string]any, allowCreate bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.charlie[window]; !ok {
+		if !allowCreate {
+			return false
+		}
+		p.appendWindowLocked(window, rows...)
+		return true
+	}
+	p.appendWindowLocked(window, rows...)
+	return true
+}
+
+// CharlieExpireOldVersions drops every retained snapshot of window except its
+// current version, so a collector holding an older saved version can no
+// longer resume and must restart from the window's first page.
+func (p *Provider) CharlieExpireOldVersions(window string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for name, w := range p.charlie {
+		if window != "" && name != window {
+			continue
+		}
+		for v := range w.snapshots {
+			if v != w.version {
+				delete(w.snapshots, v)
+			}
+		}
+	}
+}
+
+func (p *Provider) putWindowLocked(name string, version int64, rows ...map[string]any) {
+	w := &charlieWindow{version: version, snapshots: map[int64][]map[string]any{}}
+	w.rows = append([]map[string]any(nil), rows...)
+	w.snapshots[version] = append([]map[string]any(nil), w.rows...)
+	p.charlie[name] = w
+}
+
+func (p *Provider) appendWindowLocked(name string, rows ...map[string]any) {
+	w, ok := p.charlie[name]
+	if !ok {
+		p.putWindowLocked(name, 1, rows...)
+		return
+	}
+	w.version++
+	w.rows = append(w.rows, rows...)
+	w.snapshots[w.version] = append([]map[string]any(nil), w.rows...)
 }
 
 func slicePage(all []map[string]any, offset, limit int) ([]map[string]any, int) {

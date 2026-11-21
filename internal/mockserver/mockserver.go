@@ -19,6 +19,11 @@ const (
 	// SharedClient is the client id used by the two institutions that share
 	// short-lived access tokens (offset and upload-window sources).
 	SharedClient = "estuary-collector"
+
+	// charlieInconsistentStatus is returned when a window version expires in
+	// the middle of a page pass. A collector must then restart the window
+	// from its first page under the current version.
+	charlieInconsistentStatus = http.StatusGone
 )
 
 type clientAuth struct {
@@ -41,16 +46,23 @@ type Server struct {
 	// invalidCursors holds cursor values that must be treated as expired.
 	invalidCursors map[string]bool
 	requestCounts  map[string]*atomic.Int64
+	// charlieManifestCalls and charliePageCalls separate the cheap window
+	// manifest from the row pages, so tests can prove unchanged windows are
+	// skipped without fetching rows.
+	charlieManifestCalls *atomic.Int64
+	charliePageCalls     *atomic.Int64
 }
 
 // New builds a mock server and its initial tokens.
 func New() *Server {
 	s := &Server{
-		Provider:       mockdata.NewProvider(),
-		clients:        map[string]*clientAuth{},
-		rateLimited:    map[string]bool{},
-		invalidCursors: map[string]bool{},
-		requestCounts:  map[string]*atomic.Int64{},
+		Provider:             mockdata.NewProvider(),
+		clients:              map[string]*clientAuth{},
+		rateLimited:          map[string]bool{},
+		invalidCursors:       map[string]bool{},
+		requestCounts:        map[string]*atomic.Int64{},
+		charlieManifestCalls: &atomic.Int64{},
+		charliePageCalls:     &atomic.Int64{},
 	}
 	s.clients[SharedClient] = &clientAuth{
 		accessToken:  "access-gen1",
@@ -71,6 +83,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
+	mux.HandleFunc("/mock/control/charlie/append", s.handleCharlieAppend)
+	mux.HandleFunc("/mock/control/charlie/expire", s.handleCharlieExpire)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
 
@@ -221,27 +235,39 @@ func (s *Server) handleBravo(w http.ResponseWriter, r *http.Request) {
 // ---------- source: charlie (upload-time windows with paging) ----------
 
 func (s *Server) handleCharlieWindows(w http.ResponseWriter, r *http.Request) {
+	s.charlieManifestCalls.Add(1)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"windows": s.Provider.CharlieWindows(),
 	})
 }
 
 func (s *Server) handleCharlieRecords(w http.ResponseWriter, r *http.Request) {
+	s.charliePageCalls.Add(1)
 	window := r.URL.Query().Get("window")
+	version := int64(atoiDefault(r.URL.Query().Get("version"), 0))
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 	limit := atoiDefault(r.URL.Query().Get("limit"), mockdata.PageLimitCharlie)
-	rows, next, ok := s.Provider.CharliePage(window, offset, limit)
+	rows, next, hasMore, servedVersion, ok, readable := s.Provider.CharliePage(window, version, offset, limit)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown window: "+window)
+		return
+	}
+	if !readable {
+		// The requested snapshot has been retired. The stored version can no
+		// longer be continued; the collector must restart this window from
+		// page zero of the current version.
+		writeError(w, charlieInconsistentStatus,
+			fmt.Sprintf("window %s version %d expired; restart at current version", window, version))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"format":      "new",
 		"window":      window,
+		"version":     servedVersion,
 		"offset":      offset,
 		"limit":       limit,
 		"next_offset": next,
-		"has_more":    len(rows) == limit,
+		"has_more":    hasMore,
 		"records":     rows,
 	})
 }
@@ -291,6 +317,49 @@ func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"expired": req.Cursor})
 }
 
+// handleCharlieAppend appends raw charlie rows to a window, creating the
+// window when requested. The window version is bumped, so the next manifest
+// read reveals that the window must be re-paged in full.
+func (s *Server) handleCharlieAppend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		Window      string           `json:"window"`
+		Create      bool             `json:"create"`
+		RecordsJSON []map[string]any `json:"records"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Window == "" {
+		writeError(w, http.StatusBadRequest, "window and records required")
+		return
+	}
+	if !s.Provider.CharlieAppend(req.Window, req.RecordsJSON, req.Create) {
+		writeError(w, http.StatusNotFound, "unknown window: "+req.Window)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"appended": len(req.RecordsJSON), "window": req.Window})
+}
+
+// handleCharlieExpire retires every retained snapshot of a window except its
+// current version, so an interrupted page pass can no longer resume and must
+// restart the window.
+func (s *Server) handleCharlieExpire(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		Window string `json:"window"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad json")
+		return
+	}
+	s.Provider.CharlieExpireOldVersions(req.Window)
+	writeJSON(w, http.StatusOK, map[string]any{"expired": req.Window})
+}
+
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -303,6 +372,8 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	for _, c := range s.requestCounts {
 		c.Store(0)
 	}
+	s.charlieManifestCalls.Store(0)
+	s.charliePageCalls.Store(0)
 	c := s.clients[SharedClient]
 	c.mu.Lock()
 	c.accessToken = "access-gen1"
@@ -326,6 +397,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		"rate_limited":     rl,
 		"token_generation": c.generation,
 		"refresh_count":    c.refreshCount,
+		"charlie_windows":  s.Provider.CharlieWindows(),
 	}
 	c.mu.Unlock()
 	s.mu.RUnlock()
@@ -334,6 +406,8 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		counts[k] = v.Load()
 	}
 	stats["request_counts"] = counts
+	stats["charlie_manifest_calls"] = s.charlieManifestCalls.Load()
+	stats["charlie_page_calls"] = s.charliePageCalls.Load()
 	writeJSON(w, http.StatusOK, stats)
 }
 

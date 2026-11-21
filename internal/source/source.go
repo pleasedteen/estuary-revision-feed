@@ -14,6 +14,7 @@ package source
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -34,11 +35,12 @@ type Page struct {
 
 // Next is the serialized read position after a page.
 type Next struct {
-	Offset       int    `json:"offset,omitempty"`
-	Cursor       string `json:"cursor,omitempty"`
-	CursorOffset int    `json:"cursor_offset,omitempty"`
-	WindowIndex  int    `json:"window_index,omitempty"`
-	WindowOffset int    `json:"window_offset,omitempty"`
+	Offset        int    `json:"offset,omitempty"`
+	Cursor        string `json:"cursor,omitempty"`
+	CursorOffset  int    `json:"cursor_offset,omitempty"`
+	Window        string `json:"window,omitempty"`
+	WindowVersion int64  `json:"window_version,omitempty"`
+	WindowOffset  int    `json:"window_offset,omitempty"`
 }
 
 // RateLimitedError wraps HTTP 429.
@@ -275,20 +277,45 @@ func NewCharlie(baseURL string, tokens *auth.Manager) *CharlieClient {
 type windowsResponse struct {
 	Windows []struct {
 		Window   string `json:"window"`
+		Version  int64  `json:"version"`
 		RowCount int    `json:"row_count"`
 	} `json:"windows"`
 }
 
+// Window is one entry of the charlie manifest. Version changes whenever the
+// window is appended to; unchanged windows can be skipped from the manifest
+// alone without fetching any of their rows.
+type Window struct {
+	Window   string
+	Version  int64
+	RowCount int
+}
+
 type charlieResponse struct {
 	Window     string           `json:"window"`
+	Version    int64            `json:"version,omitempty"`
 	NextOffset int              `json:"next_offset"`
 	HasMore    bool             `json:"has_more"`
 	Records    []map[string]any `json:"records"`
 }
 
+// WindowVersionExpiredError wraps charlie's HTTP 410 for a window version
+// that has been retired: the retained snapshot is gone, so the pass must
+// restart from the first page of the window's current version.
+type WindowVersionExpiredError struct {
+	Source  string
+	Window  string
+	Version int64
+}
+
+func (e *WindowVersionExpiredError) Error() string {
+	return fmt.Sprintf("%s window %s version %d expired, restarting window", e.Source, e.Window, e.Version)
+}
+
 // FetchWindows returns the current ordered list of upload windows. The list
-// is re-fetched every synchronization so newly opened windows are discovered.
-func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
+// is re-fetched every synchronization so newly attached windows — including
+// ones whose upload time sorts before an already-read window — are seen.
+func (c *CharlieClient) FetchWindows(ctx context.Context) ([]Window, error) {
 	_, body, err := c.do(ctx, "/sources/charlie/windows", nil)
 	if err != nil {
 		return nil, err
@@ -297,21 +324,31 @@ func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
 	if err := decode(body, &resp); err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(resp.Windows))
+	out := make([]Window, 0, len(resp.Windows))
 	for _, w := range resp.Windows {
-		out = append(out, w.Window)
+		out = append(out, Window{Window: w.Window, Version: w.Version, RowCount: w.RowCount})
 	}
 	return out, nil
 }
 
-// FetchWindowPage returns one page inside an upload window.
-func (c *CharlieClient) FetchWindowPage(ctx context.Context, window string, offset int) (Page, error) {
+// FetchWindowPage returns one page inside an upload window version. A
+// version of zero means the window's current version. The response reports
+// the version that was actually served, so a pass pinned to an older version
+// still fetchable after the window moved on can resume safely.
+func (c *CharlieClient) FetchWindowPage(ctx context.Context, window string, version int64, offset int) (Page, error) {
 	q := url.Values{}
 	q.Set("window", window)
+	if version > 0 {
+		q.Set("version", fmt.Sprintf("%d", version))
+	}
 	q.Set("offset", fmt.Sprintf("%d", offset))
 	q.Set("limit", fmt.Sprintf("%d", mockdata.PageLimitCharlie))
 	_, body, err := c.do(ctx, "/sources/charlie/records", q)
 	if err != nil {
+		var gone *CursorExpiredError
+		if errors.As(err, &gone) {
+			return Page{}, &WindowVersionExpiredError{Source: c.Name, Window: window, Version: version}
+		}
 		return Page{}, err
 	}
 	var resp charlieResponse
@@ -319,8 +356,12 @@ func (c *CharlieClient) FetchWindowPage(ctx context.Context, window string, offs
 		return Page{}, err
 	}
 	return Page{
-		Records:  resp.Records,
-		Position: Next{WindowOffset: resp.NextOffset},
-		Done:     !resp.HasMore,
+		Records: resp.Records,
+		Position: Next{
+			Window:        window,
+			WindowVersion: resp.Version,
+			WindowOffset:  resp.NextOffset,
+		},
+		Done: !resp.HasMore,
 	}, nil
 }

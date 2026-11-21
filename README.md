@@ -81,13 +81,15 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 | `POST /v1/sync` | 触发一轮同步 |
 
 批次直接落盘在 `-data` 目录：`batches/batches.jsonl`（每行一个批次信封，
-超过 1 MiB 自动轮转为 `batch-NNNN.jsonl`），读取位置在 `state/state.json`。
+超过轮转阈值自动轮转为 `batch-NNNN.jsonl`，默认 1 MiB，可用
+`-rotate-bytes` 调整），读取位置在 `state/state.json`。
 
 ### 模拟源控制端点（仅模拟服务提供）
 
 ```bash
 curl -X POST http://127.0.0.1:18081/mock/control/stage     # 推进一个数据阶段
 curl -X POST "http://127.0.0.1:18081/mock/control/ratelimit?source=alpha&on=true"
+curl -X POST "http://127.0.0.1:18081/mock/control/failpage?source=alpha&page=2&status=429"  # 让某来源第 N 页失败一次
 curl -X POST http://127.0.0.1:18081/mock/control/reset      # 全部复位
 curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等
 ```
@@ -99,9 +101,10 @@ scripts/verify.sh
 ```
 
 脚本会构建二进制、运行全部 Go 测试（核心包带 `-race`），再通过真实 HTTP 接口
-依次演示：三种分页首轮采集、新旧格式与 `g/m³ → mg/L` 统一、修订/撤回/改期同批、
-幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、崩溃后续跑以及下游
-按保存位置续读。依赖安装时间不计入。
+依次演示：第二页 429 后同进程重试不丢第一页、三种分页首轮采集、新旧格式与
+`g/m³ → mg/L` 统一、修订/撤回/改期同批、幂等重跑、限流隔离、共享令牌单次刷新、
+游标过期头回读防复活、崩溃后续跑，以及用轮转前保存的书签按 `next_seq` 与较小
+`limit` 跨文件续读、确认每个已发布批次完整且只出现一次。依赖安装时间不计入。
 
 只跑 Go 测试：
 
@@ -110,6 +113,11 @@ go test ./...            # 功能测试
 go test -race ./...      # 含竞态检测
 ```
 
+新增回归测试：`Test12_PageTwoRateLimitedRetrySameProcess`（第二页 429 后同进程
+重试，第一页不丢且失败期间不对外可见）、`Test13_AppendInterruptedMidBatch`
+（追加中途中断）、`Test14_InterruptedAfterPublishBeforePosition`（批次落盘后、
+位置未保存时中断，并按轮转前的书签续读）。
+
 ## 关键语义与实现方式
 
 ### 1. 修订先后与去重
@@ -117,6 +125,11 @@ go test -race ./...      # 含竞态检测
 采样编号在机构内唯一，同一条记录的修订号（`rev` / `revisionId`）单调递增。
 引擎为每个归档键（机构|采样号|采样日）维护已知最大修订号；**修订号不大于已知
 值的回读记录一律忽略**，因此重复同步、游标过期后的头回读都不会再次产生变更。
+
+关键点：一轮抓取先在**私有暂存层**上推导变更，只有在批次持久化之后才把暂存层
+合入共享索引。因此第 2 页返回 429 时，第 1 页已抓到的记录既不会进入索引，也不会
+对外可见；同进程重试仍把它们当作新记录，第一页不会丢失。
+对应测试：`Test12_PageTwoRateLimitedRetrySameProcess`。
 
 ### 2. 撤回后旧修订不能让记录复活
 
@@ -137,27 +150,42 @@ go test -race ./...      # 含竞态检测
 `sampleId/revisionId/...`，旧格式状态 `A/D`）。浓度统一用 `math/big.Rat`
 精确换算为 mg/L（`1 g/m³ = 1 mg/L`），以十进制字符串保存避免浮点漂移。
 
-### 5. 断点续传与崩溃恢复
+### 5. 提交顺序、断点续传与崩溃恢复
 
-- 每抓完一页先发布批次（临时文件 + `rename` 原子落盘，`fsync` 后返回），
-  **再**保存下一页的读取位置；位置落盘同样是临时文件 + 原子替换。
-- 进程重启后，记录索引通过**重放全部已发布批次**重建，序号计数器扫描批次文件
-  恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
-- 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
-  `seq > after_seq`，文件轮转不影响旧位置。
-对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
+单个来源一轮内的提交顺序固定为：
+
+1. 抓完该来源的所有页，在私有暂存层推导变更（不触碰共享索引或已存位置）；
+2. **发布批次**：整批作为一行追加并 `fsync`，失败则截断回滚，不留下半行；
+3. **更新共享索引**：批次落盘后，`/v1/batches` 与 `/v1/records` 同时变得可见；
+4. **保存下一读取位置**：临时文件 + 原子替换，只在上一步之后进行。
+
+由此得到的语义：
+
+- 任一步失败都不会对外暴露半成品；`/v1/records` 永远不会出现尚未发布的记录，
+  `/v1/batches` 永远不会出现尚未写全的行。
+- 批次落盘后、位置保存前中断：重启时索引通过**重放全部已发布批次**重建，
+  重新抓取该来源只会得到空增量并补存位置，不会重复发布。
+- 追加中途中断留下残行：`Open` 会把主动文件回退到最后一个完整行再恢复序号。
+- 下游保存的 `next_seq` 永远落在批次边界上：读取按**整批**返回（包含任一
+  `seq > after_seq` 的信封整封返回），因此用较小 `limit` 跨文件续读时，每个
+  已发布批次都完整且只出现一次。
+对应测试：`Test10_InterruptResume`、`Test13_AppendInterruptedMidBatch`、
+`Test14_InterruptedAfterPublishBeforePosition`、`Test6_DownstreamReadPosition`、
+`internal/store` 的 `TestRotationAndBatchBoundaries`、`TestTornTailRepair`。
 
 ### 6. 限流隔离与令牌刷新
 
 三个来源在同一轮同步中以独立 goroutine 运行；429 被包装成
 `RateLimitedError`，只让该来源本轮标记为 `rate_limited`，其余两个继续完成。
-共享令牌的 401 在客户端透明刷新一次后重试，刷新由 `auth.Manager` 单飞合并，
-同一代令牌失效无论多少并发调用都只产生一次刷新请求。
-对应测试：`Test8_TokenSingleRefresh`、`Test9_RateLimitIsolation`。
+失败来源整轮丢弃：不发布批次、不推进位置，因此下一次重试会从头补齐（同一进程内
+重试也一样）。共享令牌的 401 在客户端透明刷新一次后重试，刷新由 `auth.Manager`
+单飞合并，同一代令牌失效无论多少并发调用都只产生一次刷新请求。
+对应测试：`Test8_TokenSingleRefresh`、`Test9_RateLimitIsolation`、
+`Test12_PageTwoRateLimitedRetrySameProcess`。
 
 ## 数据文件格式
 
-`batches/batches.jsonl` 每行一个批次信封：
+`batches/batches.jsonl` 每行一个批次信封（轮转后为 `batch-NNNN.jsonl`）：
 
 ```json
 {

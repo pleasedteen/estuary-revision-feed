@@ -2,7 +2,7 @@
 // independently, normalizes every record, derives monotonic changes against
 // the already-published history, and appends crash-safe batches.
 //
-// Durability model
+// Durability and visibility model
 //
 //	Batches (JSON Lines) are the authoritative record. The read-position
 //	state file only records where the next run starts. On startup the
@@ -11,6 +11,17 @@
 //	  - replayed revisions never produce changes twice (revisions are
 //	    monotonic per sample);
 //	  - an old revision of a withdrawn record can never resurrect it.
+//
+// A source run is buffered, not applied page by page. Fetched records are
+// derived against a private staging overlay; the shared record index is only
+// advanced after the run's batch has been durably published. Consequently:
+//   - a 429/failure on page N discards the whole partial run and leaves the
+//     saved position untouched, so the next run re-reads page 1 and still
+//     emits its changes (nothing was swallowed by a half-advanced index);
+//   - /v1/records never exposes a record before its batch is on disk, and
+//     /v1/batches never exposes a half-appended line;
+//   - publish, index update and checkpoint happen in that order, so a crash
+//     between publish and checkpoint resumes with an empty delta.
 //
 // A reschedule arrives as adjacent revisions (withdrawal under the old day,
 // insert under the new day). All changes of one source run are published in
@@ -44,7 +55,7 @@ type indexEntry struct {
 // SourceResult summarizes one source's run.
 type SourceResult struct {
 	Source        string `json:"source"`
-	Status        string `json:"status"` // ok, rate_limited, failed
+	Status        string `json:"status"` // ok, rate_limited, failed, interrupted
 	PagesFetched  int    `json:"pages_fetched"`
 	RecordsSeen   int    `json:"records_seen"`
 	Changes       int    `json:"changes"`
@@ -75,8 +86,14 @@ type Engine struct {
 
 	// Hook used by tests to inject failures mid-run. It receives the source
 	// name, the zero-based page number just processed within that source and
-	// the next read position returned by the page.
+	// the next read position returned by the page. A panic here aborts the
+	// source run exactly like an interrupted process.
 	hookAfterPage func(source string, pageNo int, next source.Next)
+
+	// Hook used by tests to model a crash after the batch is durably
+	// published (and the in-memory index advanced) but before the read
+	// position is saved. A panic here leaves the batch authoritative.
+	hookAfterPublish func(source string)
 }
 
 // New builds an engine and rebuilds the record index from published batches.
@@ -98,6 +115,12 @@ func New(st *store.Store, stt *state.Store, a *source.AlphaClient, b *source.Bra
 // SetPageHook installs a test hook invoked after every fetched page.
 func (e *Engine) SetPageHook(h func(source string, pageNo int, next source.Next)) {
 	e.hookAfterPage = h
+}
+
+// SetPublishHook installs a test hook invoked after a batch is published and
+// the index updated, but before the read position is checkpointed.
+func (e *Engine) SetPublishHook(h func(source string)) {
+	e.hookAfterPublish = h
 }
 
 // Syncing reports whether a run is currently in progress.
@@ -126,7 +149,7 @@ func (e *Engine) rebuildIndex() error {
 }
 
 // Materialized returns the currently visible (non-withdrawn) records, sorted
-// by archive day and sample id.
+// by archive day and sample id. Only published changes are represented.
 func (e *Engine) Materialized() []domain.CanonicalRecord {
 	e.idxMu.RLock()
 	defer e.idxMu.RUnlock()
@@ -184,62 +207,92 @@ func (e *Engine) Sync(ctx context.Context) Report {
 	return report
 }
 
-// derive applies one raw record to the index and returns the change it
-// causes, or nil when the revision is stale or a no-op.
-func (e *Engine) derive(raw map[string]any) (*domain.Change, error) {
+// stager buffers one source run. Derivation consults the shared index plus a
+// private overlay of changes this run has already produced, but never mutates
+// the shared index; that only happens on commit, after durable publication.
+type stager struct {
+	e       *Engine
+	staged  map[string]*indexEntry
+	changes []domain.Change
+}
+
+func newStager(e *Engine) *stager {
+	return &stager{e: e, staged: map[string]*indexEntry{}}
+}
+
+// derive normalizes one raw record and appends the change it would cause, or
+// does nothing when the revision is stale or a no-op.
+func (s *stager) derive(raw map[string]any) error {
 	rec, err := normalize.Record(raw)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	key := rec.Key()
 
-	e.idxMu.Lock()
-	defer e.idxMu.Unlock()
-	existing, known := e.index[key]
-
+	if ent, ok := s.staged[key]; ok && rec.Revision <= ent.revision {
+		return nil
+	}
+	s.e.idxMu.RLock()
+	existing, known := s.e.index[key]
+	s.e.idxMu.RUnlock()
 	if known && rec.Revision <= existing.revision {
 		// Stale revision. In particular, an old active revision re-read after
 		// a cursor restart must not resurrect a withdrawn record.
-		return nil, nil
+		return nil
 	}
 
-	var ch *domain.Change
 	if rec.Withdrawn {
-		ch = &domain.Change{
+		s.staged[key] = &indexEntry{revision: rec.Revision, withdrawn: true}
+		s.changes = append(s.changes, domain.Change{
 			Op:          domain.OpWithdraw,
 			Institution: rec.Institution,
 			SampleID:    rec.SampleID,
 			SampledOn:   rec.SampledOn,
 			Revision:    rec.Revision,
-		}
-		e.index[key] = &indexEntry{revision: rec.Revision, withdrawn: true}
-	} else {
-		cp := rec
-		ch = &domain.Change{
-			Op:          domain.OpUpsert,
-			Institution: rec.Institution,
-			SampleID:    rec.SampleID,
-			SampledOn:   rec.SampledOn,
-			Revision:    rec.Revision,
-			Record:      &cp,
-		}
-		e.index[key] = &indexEntry{revision: rec.Revision, record: &cp}
+		})
+		return nil
 	}
-	return ch, nil
+	cp := rec
+	s.staged[key] = &indexEntry{revision: rec.Revision, record: &cp}
+	s.changes = append(s.changes, domain.Change{
+		Op:          domain.OpUpsert,
+		Institution: rec.Institution,
+		SampleID:    rec.SampleID,
+		SampledOn:   rec.SampledOn,
+		Revision:    rec.Revision,
+		Record:      &cp,
+	})
+	return nil
 }
 
-// publishAndCheckpoint writes the run's batch and then persists the next
-// read position. The position is only advanced after durable publication.
-func (e *Engine) publishAndCheckpoint(source, batchID string, changes []domain.Change, pos state.Position) (string, error) {
-	if len(changes) > 0 {
-		env, err := e.store.Publish(batchID, changes)
+// commit publishes the run's batch, then advances the shared index, then
+// checkpoints the next read position. Holding idxMu across publish+index means
+// /v1/records can never show a record whose batch is not yet durable, while
+// /v1/batches (which reads the store) and /v1/records flip together.
+//
+// A failure before the position is saved is safe: the next run re-reads from
+// the old position, but the published revisions are already in the index and
+// derive to nothing, so it just advances the checkpoint.
+func (e *Engine) commit(source, batchID string, st *stager, pos state.Position) (string, error) {
+	e.idxMu.Lock()
+	if len(st.changes) > 0 {
+		env, err := e.store.Publish(batchID, st.changes)
 		if err != nil {
+			e.idxMu.Unlock()
 			return "", fmt.Errorf("publish batch: %w", err)
 		}
 		batchID = env.BatchID
 	}
+	for key, ent := range st.staged {
+		e.index[key] = ent
+	}
+	e.idxMu.Unlock()
+
+	if e.hookAfterPublish != nil {
+		e.hookAfterPublish(source)
+	}
 	if err := e.states.Update(source, pos); err != nil {
-		return "", fmt.Errorf("save position: %w", err)
+		return batchID, fmt.Errorf("save position: %w", err)
 	}
 	return batchID, nil
 }
@@ -262,8 +315,9 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 	res.Source = mockdata.InstitutionAlpha
 	pos := e.states.Get(mockdata.InstitutionAlpha)
 	offset := pos.Offset
-	var changes []domain.Change
+	st := newStager(e)
 	run := 0
+	last := source.Next{Offset: offset}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -278,15 +332,12 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 		res.PagesFetched++
 		for _, raw := range page.Records {
 			res.RecordsSeen++
-			ch, derr := e.derive(raw)
-			if derr != nil {
+			if derr := st.derive(raw); derr != nil {
 				res.Status, res.Error = "failed", derr.Error()
 				return res
 			}
-			if ch != nil {
-				changes = append(changes, *ch)
-			}
 		}
+		last = page.Position
 		if e.hookAfterPage != nil {
 			e.hookAfterPage(mockdata.InstitutionAlpha, run, page.Position)
 		}
@@ -296,13 +347,13 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 			break
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionAlpha, e.newBatchID(mockdata.InstitutionAlpha, run), changes,
-		state.Position{Offset: offset})
+	bid, err := e.commit(mockdata.InstitutionAlpha, e.newBatchID(mockdata.InstitutionAlpha, run), st,
+		state.Position{Offset: last.Offset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = len(st.changes), bid, "ok"
 	return res
 }
 
@@ -313,8 +364,9 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 	pos := e.states.Get(mockdata.InstitutionBravo)
 	cursor := pos.Cursor
 	cursorOffset := pos.CursorOffset
-	var changes []domain.Change
+	st := newStager(e)
 	run := 0
+	last := source.Next{Cursor: cursor, CursorOffset: cursorOffset}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -337,15 +389,12 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 		res.PagesFetched++
 		for _, raw := range page.Records {
 			res.RecordsSeen++
-			ch, derr := e.derive(raw)
-			if derr != nil {
+			if derr := st.derive(raw); derr != nil {
 				res.Status, res.Error = "failed", derr.Error()
 				return res
 			}
-			if ch != nil {
-				changes = append(changes, *ch)
-			}
 		}
+		last = page.Position
 		if e.hookAfterPage != nil {
 			e.hookAfterPage(mockdata.InstitutionBravo, run, page.Position)
 		}
@@ -356,13 +405,13 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 			break
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionBravo, e.newBatchID(mockdata.InstitutionBravo, run), changes,
-		state.Position{Cursor: cursor, CursorOffset: cursorOffset})
+	bid, err := e.commit(mockdata.InstitutionBravo, e.newBatchID(mockdata.InstitutionBravo, run), st,
+		state.Position{Cursor: last.Cursor, CursorOffset: last.CursorOffset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = len(st.changes), bid, "ok"
 	return res
 }
 
@@ -382,7 +431,11 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 		windowIndex = len(windows)
 	}
 	windowOffset := pos.WindowOffset
-	var changes []domain.Change
+	if windowIndex >= len(windows) {
+		// Nothing new to read right now; keep the position pinned to the end.
+		windowOffset = 0
+	}
+	st := newStager(e)
 	run := 0
 
 	for windowIndex < len(windows) {
@@ -400,13 +453,9 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 			res.PagesFetched++
 			for _, raw := range page.Records {
 				res.RecordsSeen++
-				ch, derr := e.derive(raw)
-				if derr != nil {
+				if derr := st.derive(raw); derr != nil {
 					res.Status, res.Error = "failed", derr.Error()
 					return res
-				}
-				if ch != nil {
-					changes = append(changes, *ch)
 				}
 			}
 			if e.hookAfterPage != nil {
@@ -421,12 +470,12 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 			}
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), changes,
+	bid, err := e.commit(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), st,
 		state.Position{WindowIndex: windowIndex, WindowOffset: windowOffset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = len(st.changes), bid, "ok"
 	return res
 }

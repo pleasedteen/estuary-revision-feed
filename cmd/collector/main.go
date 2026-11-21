@@ -19,9 +19,12 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:18080", "listen address")
 	mock := flag.String("mock", "127.0.0.1:18081", "mock server address")
 	dataDir := flag.String("data", "./data", "local data directory (state + JSONL batches)")
+	rotate := flag.Int64("rotate-bytes", 0, "batch file rotation threshold in bytes (0 = 1 MiB default)")
 	flag.Parse()
 
-	svc, err := service.New(service.DefaultConfig(*dataDir, *mock))
+	cfg := service.DefaultConfig(*dataDir, *mock)
+	cfg.RotateBytes = *rotate
+	svc, err := service.New(cfg)
 	if err != nil {
 		log.Fatalf("init service: %v", err)
 	}

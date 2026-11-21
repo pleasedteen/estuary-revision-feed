@@ -5,16 +5,23 @@
 // have seen and pass it back on the next read, so batches remain available
 // for multiple independent consumers and read positions never expire.
 //
-// Writes are crash-safe: a batch is fully rendered into a temporary file and
-// renamed into place only once, so an interrupted sync can never leave a
-// half-written line behind. On restart the highest sequence is rebuilt by
-// scanning the batch directory, making the batches themselves the
-// authoritative durability record.
+// Writes are crash-safe: a batch is a single line appended to the active file
+// and fsynced before Publish returns. An interruption during the append can
+// leave a partial trailing line; Open repairs that tail back to the last
+// complete line, so batches themselves remain the authoritative durability
+// record. On restart the highest sequence is rebuilt by scanning the batch
+// directory.
+//
+// A batch is the atomic unit for downstream readers: ReadAfter returns whole
+// envelopes only, never a subset of a batch's changes. The next_seq a caller
+// saves is therefore always a batch boundary, and continuing from it can never
+// split or repeat a published batch.
 package store
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,7 +35,7 @@ import (
 )
 
 const (
-	// RotateBytes starts a new JSONL file once the current one passes 1 MiB.
+	// RotateBytes is the default size at which a new JSONL file is started.
 	RotateBytes = 1 << 20
 	activeName  = "batches.jsonl"
 )
@@ -41,14 +48,26 @@ type Store struct {
 	nextSeq  int64
 	active   *os.File
 	activeSz int64
+	// rotateBytes starts a new file once the active one reaches this size.
+	// Zero means RotateBytes; tests override it with OpenWithRotation.
+	rotateBytes int64
 }
 
 // Open prepares the batches directory and rebuilds the sequence counter.
 func Open(dir string) (*Store, error) {
+	return OpenWithRotation(dir, RotateBytes)
+}
+
+// OpenWithRotation is Open with an explicit rotation threshold. Sizes below
+// one byte fall back to RotateBytes.
+func OpenWithRotation(dir string, rotateBytes int64) (*Store, error) {
+	if rotateBytes <= 0 {
+		rotateBytes = RotateBytes
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	s := &Store{dir: dir, nextSeq: 1}
+	s := &Store{dir: dir, nextSeq: 1, rotateBytes: rotateBytes}
 	if err := s.rebuild(); err != nil {
 		return nil, err
 	}
@@ -56,7 +75,11 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, _ := f.Stat()
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
 	s.active = f
 	s.activeSz = info.Size()
 	return s, nil
@@ -100,15 +123,23 @@ func (s *Store) Publish(batchID string, changes []domain.Change) (domain.Envelop
 
 	// Rotate into an immutable, sequence-prefixed file before appending, so a
 	// reader that follows files by name never sees a renamed-away file.
-	if s.activeSz >= RotateBytes {
+	if s.activeSz >= s.rotateBytes {
 		if err := s.rotateLocked(); err != nil {
 			return domain.Envelope{}, err
 		}
 	}
-	if _, err := s.active.Write(line); err != nil {
-		return domain.Envelope{}, err
+	start := s.activeSz
+	n, err := s.active.Write(line)
+	if err == nil && n != len(line) {
+		err = fmt.Errorf("short write: wrote %d of %d bytes", n, len(line))
 	}
-	if err := s.active.Sync(); err != nil {
+	if err == nil {
+		err = s.active.Sync()
+	}
+	if err != nil {
+		// Roll back a partial append so readers and the next Open never see
+		// a torn line. O_APPEND makes the next write land at the end again.
+		_ = s.active.Truncate(start)
 		return domain.Envelope{}, err
 	}
 	s.nextSeq += int64(len(changes))
@@ -116,14 +147,22 @@ func (s *Store) Publish(batchID string, changes []domain.Change) (domain.Envelop
 	return env, nil
 }
 
-// ReadAfter returns changes whose sequence is strictly greater than afterSeq,
-// up to limit envelopes (0 means unlimited). The scan always starts from the
-// first batch file, so any saved downstream position remains valid even when
-// the collector restarted and rotated files.
+// ReadAfter returns whole envelopes containing any sequence strictly greater
+// than afterSeq, up to limit envelopes (0 means unlimited). The scan always
+// starts from the first batch file, so any saved downstream position remains
+// valid even when the collector restarted and rotated files.
+//
+// Batches are returned intact: a caller that saves the returned next_seq (the
+// last sequence of the last envelope) always resumes on a batch boundary, so
+// every published batch is seen completely and exactly once.
+//
+// Publication is atomic for readers as well: the returned slice is a stable
+// snapshot taken under the store lock, so a concurrent Publish cannot inject a
+// half-appended line or reorder batches.
 func (s *Store) ReadAfter(afterSeq int64, limit int) ([]domain.Envelope, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	names := s.batchFilesLocked()
-	s.mu.Unlock()
 
 	var out = make([]domain.Envelope, 0)
 	for _, name := range names {
@@ -139,15 +178,17 @@ func (s *Store) ReadAfter(afterSeq int64, limit int) ([]domain.Envelope, error) 
 				f.Close()
 				return nil, fmt.Errorf("corrupt batch line in %s: %w", name, err)
 			}
-			// Filter at change granularity: an envelope may straddle the
-			// saved position even when its first sequence is not past it.
-			kept := keepChangesAfter(env, afterSeq)
-			if len(kept.Changes) > 0 {
-				out = append(out, kept)
-				if limit > 0 && len(out) >= limit {
-					f.Close()
-					return out, nil
-				}
+			if len(env.Changes) == 0 {
+				continue
+			}
+			// The batch is the atomic unit: include it whole or not at all.
+			if env.Changes[len(env.Changes)-1].Seq <= afterSeq {
+				continue
+			}
+			out = append(out, env)
+			if limit > 0 && len(out) >= limit {
+				f.Close()
+				return out, nil
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -159,17 +200,6 @@ func (s *Store) ReadAfter(afterSeq int64, limit int) ([]domain.Envelope, error) 
 	return out, nil
 }
 
-func keepChangesAfter(env domain.Envelope, afterSeq int64) domain.Envelope {
-	kept := env
-	kept.Changes = kept.Changes[:0:0]
-	for _, c := range env.Changes {
-		if c.Seq > afterSeq {
-			kept.Changes = append(kept.Changes, c)
-		}
-	}
-	return kept
-}
-
 // MaxSeq returns the highest sequence that has been published (0 if empty).
 func (s *Store) MaxSeq() int64 {
 	s.mu.Lock()
@@ -177,7 +207,8 @@ func (s *Store) MaxSeq() int64 {
 	return s.nextSeq - 1
 }
 
-// rebuild scans every JSONL file and recovers the next sequence number.
+// rebuild repairs a torn tail left by an interrupted append, then scans every
+// JSONL file and recovers the next sequence number.
 func (s *Store) rebuild() error {
 	names, err := s.batchFiles()
 	if err != nil {
@@ -185,32 +216,110 @@ func (s *Store) rebuild() error {
 	}
 	var maxSeq int64
 	for _, name := range names {
-		f, err := os.Open(filepath.Join(s.dir, name))
-		if err != nil {
-			return err
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			var env domain.Envelope
-			if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
-				f.Close()
-				return fmt.Errorf("corrupt batch line in %s: %w", name, err)
+		path := filepath.Join(s.dir, name)
+		good, scanErr := s.scanFile(path, &maxSeq)
+		if scanErr == nil {
+			// Drop any bytes after the last complete batch line. A torn append
+			// has no trailing newline, so scanFile stopped cleanly but short.
+			info, err := os.Stat(path)
+			if err != nil {
+				return err
 			}
-			for _, c := range env.Changes {
-				if c.Seq > maxSeq {
-					maxSeq = c.Seq
+			if info.Size() > good {
+				if err := truncateTo(path, good); err != nil {
+					return err
 				}
 			}
+			continue
 		}
-		if err := scanner.Err(); err != nil {
-			f.Close()
+		if !errors.Is(scanErr, errTornTail) || name != activeName {
+			return scanErr
+		}
+		// Only the active file's newline-less trailing fragment is a torn
+		// append from a crash. Discard it so the batch boundary is authoritative.
+		if err := truncateTo(path, good); err != nil {
 			return err
 		}
-		f.Close()
 	}
 	s.nextSeq = maxSeq + 1
 	return nil
+}
+
+// errTornTail marks a trailing fragment with no newline: a crash mid-append.
+var errTornTail = errors.New("torn batch tail")
+
+// scanFile reads lines from path, folding their sequence numbers into maxSeq,
+// and returns the byte length of the longest valid prefix. A decode error stops
+// the scan and is returned together with that prefix length.
+func (s *Store) scanFile(path string, maxSeq *int64) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	var good int64
+	for scanner.Scan() {
+		var env domain.Envelope
+		if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
+			terminated, terr := fileEndsWithNewline(path)
+			if terr != nil {
+				return good, terr
+			}
+			if !terminated {
+				// A trailing line with no newline is a torn append from a crash
+				// and may be discarded. A terminated corrupt line is real
+				// corruption and must be surfaced.
+				return good, errTornTail
+			}
+			return good, fmt.Errorf("corrupt batch line in %s: %w", filepath.Base(path), err)
+		}
+		good += int64(len(scanner.Bytes())) + 1
+		for _, c := range env.Changes {
+			if c.Seq > *maxSeq {
+				*maxSeq = c.Seq
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return good, err
+	}
+	return good, nil
+}
+
+// fileEndsWithNewline reports whether the last byte of path is a newline.
+func fileEndsWithNewline(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if info.Size() == 0 {
+		return true, nil
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], info.Size()-1); err != nil {
+		return false, err
+	}
+	return b[0] == '\n', nil
+}
+
+// truncateTo drops everything after size and fsyncs the file.
+func truncateTo(path string, size int64) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func (s *Store) rotateLocked() error {

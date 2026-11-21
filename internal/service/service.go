@@ -24,6 +24,8 @@ type Config struct {
 	ClientID     string
 	RefreshToken string
 	BravoToken   string
+	// RotateBytes overrides the batch-file rotation threshold (0 = default).
+	RotateBytes int64
 }
 
 // Service is the running local collection service.
@@ -35,7 +37,7 @@ type Service struct {
 
 // New builds stores, token managers, source clients and the engine.
 func New(cfg Config) (*Service, error) {
-	batch, err := store.Open(cfg.DataDir + "/batches")
+	batch, err := store.OpenWithRotation(cfg.DataDir+"/batches", cfg.RotateBytes)
 	if err != nil {
 		return nil, err
 	}

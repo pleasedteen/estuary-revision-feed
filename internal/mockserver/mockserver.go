@@ -38,6 +38,12 @@ type Server struct {
 	clients map[string]*clientAuth
 	// rateLimited marks sources currently answering 429.
 	rateLimited map[string]bool
+	// failPage marks a source's page index that must answer 429 (or 500 when
+	// status is set). pageRequests counts requests per source so "page 2"
+	// survives the retry that follows the failure.
+	failPage     map[string]int
+	failStatus   map[string]int
+	pageRequests map[string]int
 	// invalidCursors holds cursor values that must be treated as expired.
 	invalidCursors map[string]bool
 	requestCounts  map[string]*atomic.Int64
@@ -49,6 +55,9 @@ func New() *Server {
 		Provider:       mockdata.NewProvider(),
 		clients:        map[string]*clientAuth{},
 		rateLimited:    map[string]bool{},
+		failPage:       map[string]int{},
+		failStatus:     map[string]int{},
+		pageRequests:   map[string]int{},
 		invalidCursors: map[string]bool{},
 		requestCounts:  map[string]*atomic.Int64{},
 	}
@@ -70,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/auth/token", s.handleToken)
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
+	mux.HandleFunc("/mock/control/failpage", s.handleFailPage)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
@@ -167,6 +177,9 @@ func bearer(r *http.Request) string {
 // ---------- source: alpha (offset) ----------
 
 func (s *Server) handleAlpha(w http.ResponseWriter, r *http.Request) {
+	if s.checkFailPage(w, mockdata.InstitutionAlpha) {
+		return
+	}
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 	limit := atoiDefault(r.URL.Query().Get("limit"), mockdata.PageLimitAlpha)
 	rows, next := s.Provider.AlphaPage(offset, limit)
@@ -187,6 +200,9 @@ func (s *Server) handleBravo(w http.ResponseWriter, r *http.Request) {
 	if s.isRateLimited(mockdata.InstitutionBravo) {
 		w.Header().Set("Retry-After", "2")
 		writeError(w, http.StatusTooManyRequests, "bravo is rate limited")
+		return
+	}
+	if s.checkFailPage(w, mockdata.InstitutionBravo) {
 		return
 	}
 	cursor := r.URL.Query().Get("cursor")
@@ -227,6 +243,9 @@ func (s *Server) handleCharlieWindows(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCharlieRecords(w http.ResponseWriter, r *http.Request) {
+	if s.checkFailPage(w, mockdata.InstitutionCharlie) {
+		return
+	}
 	window := r.URL.Query().Get("window")
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 	limit := atoiDefault(r.URL.Query().Get("limit"), mockdata.PageLimitCharlie)
@@ -273,6 +292,43 @@ func (s *Server) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"source": source, "rate_limited": on})
 }
 
+func (s *Server) handleFailPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	source := r.URL.Query().Get("source")
+	page := atoiDefault(r.URL.Query().Get("page"), 2)
+	status := atoiDefault(r.URL.Query().Get("status"), http.StatusTooManyRequests)
+	s.mu.Lock()
+	s.failPage[source] = page
+	s.failStatus[source] = status
+	s.pageRequests[source] = 0
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"source": source, "page": page, "status": status})
+}
+
+// checkFailPage answers the configured failure for the source's next page
+// request exactly once, then lets the retry through.
+func (s *Server) checkFailPage(w http.ResponseWriter, source string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pageRequests[source]++
+	target, ok := s.failPage[source]
+	if !ok || s.pageRequests[source] != target {
+		return false
+	}
+	status := s.failStatus[source]
+	delete(s.failPage, source)
+	if status == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, source+" page rate limited")
+		return true
+	}
+	writeError(w, status, source+" page failed")
+	return true
+}
+
 func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -299,6 +355,9 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.Provider.Reset()
 	s.mu.Lock()
 	s.rateLimited = map[string]bool{}
+	s.failPage = map[string]int{}
+	s.failStatus = map[string]int{}
+	s.pageRequests = map[string]int{}
 	s.invalidCursors = map[string]bool{}
 	for _, c := range s.requestCounts {
 		c.Store(0)

@@ -34,9 +34,14 @@ type harness struct {
 	dir     string
 	svc     *service.Service
 	mockURL string
+	cfg     service.Config
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWith(t, nil)
+}
+
+func newHarnessWith(t *testing.T, mutate func(*service.Config)) *harness {
 	t.Helper()
 	mock := mockserver.New()
 	srv := httptest.NewServer(mock.Handler())
@@ -51,11 +56,25 @@ func newHarness(t *testing.T) *harness {
 		RefreshToken: "refresh-token-v1",
 		BravoToken:   "bravo-static-token",
 	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	svc, err := service.New(cfg)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
-	return &harness{t: t, mock: mock, mockSrv: srv, dir: dir, svc: svc, mockURL: srv.URL}
+	return &harness{t: t, mock: mock, mockSrv: srv, dir: dir, svc: svc, mockURL: srv.URL, cfg: cfg}
+}
+
+// restart rebuilds the service from the on-disk state, as a process restart
+// would: published batches and saved positions survive, memory does not.
+func (h *harness) restart() {
+	h.t.Helper()
+	svc, err := service.New(h.cfg)
+	if err != nil {
+		h.t.Fatalf("restart service: %v", err)
+	}
+	h.svc = svc
 }
 
 func (h *harness) sync() collector.Report {
@@ -173,6 +192,26 @@ func sourceResult(rep collector.Report, name string) collector.SourceResult {
 		}
 	}
 	return collector.SourceResult{}
+}
+
+// httpRecords reads /v1/records through the real HTTP handler, so a test can
+// prove the visibility guarantee at the boundary downstream consumers use.
+func httpRecords(t *testing.T, h *harness) []map[string]any {
+	t.Helper()
+	srv := httptest.NewServer(h.svc.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/v1/records")
+	if err != nil {
+		t.Fatalf("get /v1/records: %v", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Records []map[string]any `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode /v1/records: %v", err)
+	}
+	return out.Records
 }
 
 // Test1_FullPipeline performs an initial sync and verifies all initial
@@ -785,3 +824,228 @@ func TestHTTPLayer(t *testing.T) {
 }
 
 var _ = source.Page{}
+
+// Test12_PageTwoRateLimitedRetrySameProcess reproduces the reported leak: the
+// mock answers 429 on alpha's second page. While alpha is blocked after page 1
+// (still unpublished), /v1/records and /v1/batches must not expose any alpha
+// record; the run must then fail without publishing or advancing the position;
+// the retry inside the same process must publish page 1 and page 2.
+func Test12_PageTwoRateLimitedRetrySameProcess(t *testing.T) {
+	h := newHarness(t)
+	h.mockPost("/mock/control/failpage?source=alpha&page=2&status=429", map[string]any{})
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h.svc.Engine.SetPageHook(func(src string, pageNo int, _ source.Next) {
+		if src == mockdata.InstitutionAlpha && pageNo == 0 {
+			once.Do(func() { close(entered) })
+			<-release
+		}
+	})
+
+	done := make(chan collector.Report, 1)
+	go func() { done <- h.sync() }()
+	<-entered
+
+	// Mid-sync, after alpha page 1 is buffered but before anything commits.
+	for _, rec := range httpRecords(t, h) {
+		if rec["institution"] == mockdata.InstitutionAlpha {
+			t.Fatalf("unpublished alpha record leaked into /v1/records mid-sync: %v", rec)
+		}
+	}
+	for _, env := range h.batchesAfter(0) {
+		for _, c := range env["changes"].([]any) {
+			if c.(map[string]any)["institution"] == mockdata.InstitutionAlpha {
+				t.Fatalf("unpublished alpha change leaked into /v1/batches mid-sync: %v", c)
+			}
+		}
+	}
+	close(release)
+	rep := <-done
+	h.svc.Engine.SetPageHook(nil)
+
+	ar := sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "rate_limited" {
+		t.Fatalf("alpha should be rate limited on page 2: %+v", ar)
+	}
+	if ar.Changes != 0 || ar.BatchID != "" {
+		t.Fatalf("a failed run must publish nothing: %+v", ar)
+	}
+	for _, env := range h.batchesAfter(0) {
+		for _, c := range env["changes"].([]any) {
+			if c.(map[string]any)["institution"] == mockdata.InstitutionAlpha {
+				t.Fatalf("alpha change published despite page-2 failure: %v", c)
+			}
+		}
+	}
+	if got := loadState(t, h.dir)["alpha"].Offset; got != 0 {
+		t.Fatalf("alpha position advanced after a failed run: offset=%d", got)
+	}
+
+	// Same process, retry without the failure.
+	rep = h.sync()
+	ar = sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "ok" || ar.Changes != 8 {
+		t.Fatalf("retry should publish all 8 alpha records: %+v", ar)
+	}
+	recs := materializedMap(h)
+	// Page 1 holds A-100..A-102; page 2 holds the rest of alpha.
+	for _, key := range []string{"alpha|A-100|2026-11-10", "alpha|A-101|2026-11-10", "alpha|A-102|2026-11-11"} {
+		if _, ok := recs[key]; !ok {
+			t.Fatalf("page-1 record %s missing after retry", key)
+		}
+	}
+	if _, ok := recs["alpha|A-108|2026-11-12"]; ok {
+		t.Fatal("unexpected stage-1 record")
+	}
+	if got := len(materializedMap(h)); got != 22 {
+		t.Fatalf("expected 22 records after retry, got %d", got)
+	}
+}
+
+// Test13_AppendInterruptedMidBatch simulates the process dying while page 2 of
+// alpha's append is in flight: page 1 was fetched but the run never committed.
+// On restart the saved position is still 0, so the whole source is re-read and
+// page 1 is not lost.
+func Test13_AppendInterruptedMidBatch(t *testing.T) {
+	h := newHarness(t)
+	var pages int32
+	h.svc.Engine.SetPageHook(func(src string, _ int, _ source.Next) {
+		if src == mockdata.InstitutionAlpha && atomic.AddInt32(&pages, 1) == 1 {
+			panic("simulated crash after alpha page 1")
+		}
+	})
+	func() {
+		defer func() { _ = recover() }()
+		h.sync()
+	}()
+	h.svc.Engine.SetPageHook(nil)
+
+	for _, env := range h.batchesAfter(0) {
+		for _, c := range env["changes"].([]any) {
+			if c.(map[string]any)["institution"] == mockdata.InstitutionAlpha {
+				t.Fatalf("interrupted alpha run published a change: %v", c)
+			}
+		}
+	}
+	if got := loadState(t, h.dir)["alpha"].Offset; got != 0 {
+		t.Fatalf("interrupted run advanced alpha position: %d", got)
+	}
+
+	h.restart()
+	rep := h.sync()
+	ar := sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "ok" || ar.Changes != 8 {
+		t.Fatalf("resume should publish all 8 alpha rows including page 1: %+v", ar)
+	}
+	// The interrupted run published no alpha change, so every alpha record can
+	// only come from the resume; count them to prove page 1 was not lost or
+	// duplicated.
+	var alphaUpserts int
+	for _, c := range allChanges(t, h) {
+		if c["institution"] == "alpha" && c["op"] == "upsert" {
+			alphaUpserts++
+		}
+	}
+	if alphaUpserts != 8 {
+		t.Fatalf("expected 8 alpha upserts after resume, got %d", alphaUpserts)
+	}
+	if _, ok := materializedMap(h)["alpha|A-100|2026-11-10"]; !ok {
+		t.Fatal("page-1 record A-100 lost after interruption")
+	}
+}
+
+// Test14_InterruptedAfterPublishBeforePosition models a crash after the batch
+// is durably published but before the read position is saved. On restart the
+// replayed source must produce an empty delta and the already-published batch
+// must remain readable exactly once. Also verifies reading continues across
+// rotation using the bookmarked next_seq with a limit smaller than a batch.
+func Test14_InterruptedAfterPublishBeforePosition(t *testing.T) {
+	// Rotate on almost every batch so continuation crosses many files.
+	h := newHarnessWith(t, func(c *service.Config) { c.RotateBytes = 1 })
+
+	var fired atomic.Bool
+	h.svc.Engine.SetPublishHook(func(src string) {
+		if src == mockdata.InstitutionAlpha {
+			fired.Store(true)
+			panic("simulated crash after publish, before checkpoint")
+		}
+	})
+	func() {
+		defer func() { _ = recover() }()
+		h.sync()
+	}()
+	h.svc.Engine.SetPublishHook(nil)
+	if !fired.Load() {
+		t.Fatal("publish hook did not fire")
+	}
+
+	// The batch is on disk even though the position was not saved.
+	envs := h.batchesAfter(0)
+	if len(envs) == 0 {
+		t.Fatal("published batch missing after crash")
+	}
+	if got := loadState(t, h.dir)["alpha"].Offset; got != 0 {
+		t.Fatalf("alpha position should not be saved, got %d", got)
+	}
+
+	// Restart: replay from offset 0. The published revisions are already in
+	// the rebuilt index, so alpha yields no new changes and the checkpoint
+	// catches up without duplicating anything.
+	h.restart()
+	rep := h.sync()
+	ar := sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "ok" || ar.Changes != 0 {
+		t.Fatalf("resume after publish must be an empty delta: %+v", ar)
+	}
+	if got := loadState(t, h.dir)["alpha"].Offset; got != 8 {
+		t.Fatalf("resume should advance alpha checkpoint to 8, got %d", got)
+	}
+
+	// Downstream: save a mid-stream bookmarked position, then keep reading
+	// with limit=1 across every file and confirm each batch appears once.
+	batchStore, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := batchStore.ReadAfter(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < 3 {
+		t.Fatalf("expected several batches to exercise rotation, got %d", len(all))
+	}
+	saved := all[0].Changes[len(all[0].Changes)-1].Seq
+
+	seenBatch := map[string]int{}
+	seenSeq := saved
+	for i := 0; i < 10000; i++ {
+		page, err := batchStore.ReadAfter(seenSeq, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, env := range page {
+			if len(env.Changes) == 0 {
+				t.Fatalf("empty batch returned")
+			}
+			seenBatch[env.BatchID]++
+			seenSeq = env.Changes[len(env.Changes)-1].Seq
+		}
+	}
+	// Only batches after the saved one are seen, each exactly once.
+	for _, env := range all {
+		if env.Changes[len(env.Changes)-1].Seq <= saved {
+			continue
+		}
+		if seenBatch[env.BatchID] != 1 {
+			t.Fatalf("batch %s seen %d times, want exactly once", env.BatchID, seenBatch[env.BatchID])
+		}
+	}
+	if seenBatch[all[0].BatchID] != 0 {
+		t.Fatalf("bookmarked batch %s was re-read", all[0].BatchID)
+	}
+}

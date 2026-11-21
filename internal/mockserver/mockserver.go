@@ -71,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
+	mux.HandleFunc("/mock/control/charlie/arm-append", s.handleCharlieArmAppend)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
 
@@ -289,6 +290,24 @@ func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	s.invalidCursors[req.Cursor] = true
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"expired": req.Cursor})
+}
+
+// handleCharlieArmAppend arms a one-shot mid-fetch append: after the next
+// charlie page is served, n generated rows appear in the given window. It
+// models rows uploaded while a synchronization round is mid-flight.
+func (s *Server) handleCharlieArmAppend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		writeError(w, http.StatusBadRequest, "window required")
+		return
+	}
+	n := atoiDefault(r.URL.Query().Get("n"), 1)
+	s.Provider.ArmCharlieAppend(window, n)
+	writeJSON(w, http.StatusOK, map[string]any{"armed_window": window, "rows": n})
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {

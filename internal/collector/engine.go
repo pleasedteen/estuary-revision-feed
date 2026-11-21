@@ -15,6 +15,14 @@
 // A reschedule arrives as adjacent revisions (withdrawal under the old day,
 // insert under the new day). All changes of one source run are published in
 // a single batch, so the withdrawal and the insert become visible together.
+//
+// The upload-window source (charlie) additionally checkpoints its per-window
+// read offsets together with a journal of derived-but-unpublished changes
+// after every page. An interrupted run resumes at the first missing page —
+// never a head rescan — and the reloaded journal still leaves with the
+// post-restart changes in one batch, so even a reschedule spanning a crash
+// is read back from a single batch. Journaled changes found already
+// published after a crash are dropped on reload, never re-emitted.
 package collector
 
 import (
@@ -368,37 +376,77 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 
 // ---------- charlie: upload-time windows ----------
 
+// syncCharlie catches up on the upload-window source. One round works from
+// the directory snapshot taken at its start: for every window it requests
+// only the rows between the saved per-window offset and the snapshot row
+// count, so back-registered earlier windows and rows appended to
+// already-consumed windows are both picked up incrementally. Rows appended
+// while the round runs are left for the next round, even when a fetched page
+// already straddles the snapshot boundary.
+//
+// After every page the per-window offsets and the pending (derived but not
+// yet published) changes are checkpointed atomically, so an interrupted run
+// resumes at the first missing page instead of rescanning, and the whole
+// catch-up — including the part completed before an interruption — is still
+// published as exactly one batch. A reschedule whose halves land on
+// different pages, or on different sides of a restart, is therefore always
+// read back from the same batch.
 func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 	res.Source = mockdata.InstitutionCharlie
 	pos := e.states.Get(mockdata.InstitutionCharlie)
 
+	// Snapshot the directory: this round covers exactly the rows visible now.
 	windows, err := e.charlie.FetchWindows(ctx)
 	if err != nil {
 		res.Status, res.Error = classifyError(err)
 		return res
 	}
-	windowIndex := pos.WindowIndex
-	if windowIndex > len(windows) {
-		windowIndex = len(windows)
-	}
-	windowOffset := pos.WindowOffset
-	var changes []domain.Change
-	run := 0
 
-	for windowIndex < len(windows) {
-		window := windows[windowIndex]
-		for {
+	consumed := charlieProgress(pos, windows)
+	pending := e.states.Pending(mockdata.InstitutionCharlie)
+	batchID := pending.BatchID
+	if batchID == "" {
+		batchID = e.newBatchID(mockdata.InstitutionCharlie, 0)
+	}
+	changes := e.recoverPending(pending.Changes)
+
+	checkpoint := func() error {
+		return e.states.Checkpoint(mockdata.InstitutionCharlie,
+			state.Position{Windows: copyWindows(consumed)},
+			state.Pending{BatchID: batchID, Changes: changes})
+	}
+
+	run := 0
+	for _, w := range windows {
+		offset := consumed[w.Name]
+		target := w.RowCount
+		for offset < target {
 			if err := ctx.Err(); err != nil {
 				res.Status, res.Error = "interrupted", err.Error()
 				return res
 			}
-			page, err := e.charlie.FetchWindowPage(ctx, window, windowOffset)
+			page, err := e.charlie.FetchWindowPage(ctx, w.Name, offset)
 			if err != nil {
 				res.Status, res.Error = classifyError(err)
 				return res
 			}
 			res.PagesFetched++
-			for _, raw := range page.Records {
+			next := page.Position.WindowOffset
+			if next <= offset {
+				break // no progress possible (defensive; the mock is append-only)
+			}
+			// Never consume past the snapshot boundary: rows appended to the
+			// window while this round runs belong to the next round.
+			rows := page.Records
+			if next > target {
+				keep := target - offset
+				if keep > len(rows) {
+					keep = len(rows)
+				}
+				rows = rows[:keep]
+				next = target
+			}
+			for _, raw := range rows {
 				res.RecordsSeen++
 				ch, derr := e.derive(raw)
 				if derr != nil {
@@ -409,24 +457,103 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 					changes = append(changes, *ch)
 				}
 			}
+			consumed[w.Name] = next
+			if err := checkpoint(); err != nil {
+				res.Status, res.Error = "failed", "save checkpoint: "+err.Error()
+				return res
+			}
 			if e.hookAfterPage != nil {
 				e.hookAfterPage(mockdata.InstitutionCharlie, run, page.Position)
 			}
-			windowOffset = page.Position.WindowOffset
 			run++
-			if page.Done {
-				windowIndex++
-				windowOffset = 0
-				break
-			}
+			offset = next
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), changes,
-		state.Position{WindowIndex: windowIndex, WindowOffset: windowOffset})
-	if err != nil {
-		res.Status, res.Error = "failed", err.Error()
+
+	if len(changes) > 0 {
+		env, err := e.store.Publish(batchID, changes)
+		if err != nil {
+			res.Status, res.Error = "failed", "publish batch: "+err.Error()
+			return res
+		}
+		batchID = env.BatchID
+	}
+	// Final checkpoint: the per-page checkpoints already advanced every
+	// offset, so this only clears the pending journal. If the process died
+	// between publish and this write, the next run reloads the journal,
+	// sees every change already reflected in the replayed index and drops
+	// them — published changes are never re-emitted.
+	if err := e.states.Checkpoint(mockdata.InstitutionCharlie,
+		state.Position{Windows: copyWindows(consumed)}, state.Pending{}); err != nil {
+		res.Status, res.Error = "failed", "save position: "+err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = len(changes), batchID, "ok"
 	return res
+}
+
+// charlieProgress resolves the per-window read offsets for one round. A
+// position saved by the previous version (window index + inner offset, no
+// per-window map) is migrated against the live directory: windows before the
+// saved index are treated as consumed up to their current directory size and
+// the window at the index keeps its saved inner offset. Upgrading therefore
+// never re-requests — and never republishes — already-read rows, while
+// windows absent from the map (newly opened or back-registered) start at 0.
+func charlieProgress(pos state.Position, windows []source.WindowInfo) map[string]int {
+	consumed := make(map[string]int, len(windows))
+	if pos.Windows != nil {
+		for w, off := range pos.Windows {
+			consumed[w] = off
+		}
+		return consumed
+	}
+	for i, w := range windows {
+		switch {
+		case i < pos.WindowIndex:
+			consumed[w.Name] = w.RowCount
+		case i == pos.WindowIndex:
+			consumed[w.Name] = pos.WindowOffset
+		}
+	}
+	return consumed
+}
+
+// recoverPending reloads changes that were checkpointed by an interrupted
+// run but not yet published. Changes already reflected in the replayed batch
+// history (a crash after publish but before the journal was cleared) are
+// dropped, so a published change is never emitted twice. Survivors are
+// re-applied to the index so revisions fetched later in this run derive
+// correctly against them.
+func (e *Engine) recoverPending(pending []domain.Change) []domain.Change {
+	if len(pending) == 0 {
+		return nil
+	}
+	kept := make([]domain.Change, 0, len(pending))
+	e.idxMu.Lock()
+	defer e.idxMu.Unlock()
+	for _, ch := range pending {
+		key := ch.Institution + "|" + ch.SampleID + "|" + ch.SampledOn
+		if ent, ok := e.index[key]; ok && ent.revision >= ch.Revision {
+			continue
+		}
+		switch ch.Op {
+		case domain.OpWithdraw:
+			e.index[key] = &indexEntry{revision: ch.Revision, withdrawn: true}
+		case domain.OpUpsert:
+			if ch.Record != nil {
+				rec := *ch.Record
+				e.index[key] = &indexEntry{revision: ch.Revision, record: &rec}
+			}
+		}
+		kept = append(kept, ch)
+	}
+	return kept
+}
+
+func copyWindows(in map[string]int) map[string]int {
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }

@@ -28,11 +28,11 @@ internal/mockdata    可复现的分阶段数据集（修订/改期/撤回/旧�
 internal/mockserver  模拟 HTTP 接口（三种分页、401/410/429、控制端点）
 internal/auth        共享令牌管理器（单飞刷新，同代只刷一次）
 internal/source      三个来源的 HTTP 客户端（401 重试、429/410 分类错误）
-internal/state       每来源读取位置，原子写盘，支持断点续传
+internal/state       每来源读取位置 + 待发布变更日志，原子写盘，支持断点续传与旧版升级
 internal/store       JSON Lines 批次存储：全局 seq、原子追加、按位置续读
-internal/collector   采集引擎：修订判定、撤回防复活、改期同批、崩溃恢复
+internal/collector   采集引擎：修订判定、撤回防复活、改期同批、窗口补齐、崩溃恢复
 internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status）
-tests                端到端测试（11 个场景 + HTTP 层测试）
+tests                端到端测试（16 个场景 + HTTP 层测试）
 scripts/verify.sh    一条命令完成的可复现验证（约 3 秒）
 ```
 
@@ -88,6 +88,7 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 ```bash
 curl -X POST http://127.0.0.1:18081/mock/control/stage     # 推进一个数据阶段
 curl -X POST "http://127.0.0.1:18081/mock/control/ratelimit?source=alpha&on=true"
+curl -X POST "http://127.0.0.1:18081/mock/control/charlie/arm-append?window=2026-11-10T00:00:00Z&n=1"  # 抓取中追加
 curl -X POST http://127.0.0.1:18081/mock/control/reset      # 全部复位
 curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等
 ```
@@ -143,11 +144,36 @@ go test -race ./...      # 含竞态检测
   **再**保存下一页的读取位置；位置落盘同样是临时文件 + 原子替换。
 - 进程重启后，记录索引通过**重放全部已发布批次**重建，序号计数器扫描批次文件
   恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
+- charlie 的窗口读取位置是**按窗口记录下一行偏移**的映射，并且每抓完一页就把
+  「窗口进度 + 已派生但未发布的变更（pending 日志）+ 预留批次号」原子写入
+  `state/state.json`。中断重启后从**第一个缺页**继续而不是重头扫；日志里未发布的
+  变更与恢复后新派生的变更**合为同一批次**发布，跨页、跨重启的改期都能从同一个
+  批次读出。若崩溃发生在「批次已发布、日志未清」之间，重放索引会识别出这些变更
+  已发布并在载入时丢弃，绝不重发。
 - 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
   `seq > after_seq`，文件轮转不影响旧位置。
-对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
+对应测试：`Test10_InterruptResume`、`Test14_CharlieCheckpointResume`、
+`Test16_CharliePublishedPendingNotReemitted`、`Test6_DownstreamReadPosition`。
 
-### 6. 限流隔离与令牌刷新
+### 6. charlie 窗口补齐：补登靠前窗口、旧窗追加、快照轮次
+
+charlie 每轮同步先取一次窗口目录（窗口名 + 行数）作为**本轮快照**，然后逐窗口只
+请求「已消费偏移 … 快照行数」之间的新增范围：
+
+- **补登排序靠前的窗口**：目录按窗口名排序，进度按窗口名记录（而非列表下标），
+  所以靠后补登的早起窗口下一轮自然出现在待读集合里，从偏移 0 读起。
+- **已读完的旧窗口被追加明细**：旧窗口的消费偏移小于快照行数，差值就是本轮要
+  补的范围，明细请求只覆盖新增行。
+- **抓取期间的追加留给下一轮**：窗口行数在抓取途中增长（模拟源用
+  `arm-append` 注入）时，越过分快照边界的行即使已经在响应里被翻到也会被截断，
+  留给下一轮按新偏移单独请求。
+- **旧数据目录升级**：旧版状态文件（`window_index`/`window_offset`，无窗口映射）
+  在升级后首轮同步时按当时目录迁移——下标之前的窗口按当前行数记为已消费、下标
+  处窗口保留原窗内偏移，因此已发布变更不重发，之后按新格式续跑。
+对应测试：`Test12_CharlieBackfillAndOldWindowAppend`、
+`Test13_CharlieAppendDuringFetch`、`Test15_CharlieStateUpgrade`。
+
+### 7. 限流隔离与令牌刷新
 
 三个来源在同一轮同步中以独立 goroutine 运行；429 被包装成
 `RateLimitedError`，只让该来源本轮标记为 `rate_limited`，其余两个继续完成。
@@ -179,3 +205,22 @@ go test -race ./...      # 含竞态检测
 ```
 
 `op` 取值 `upsert`（含完整规范记录）或 `withdraw`（仅定位键与修订号）。
+
+`state/state.json` 保存每来源读取位置，charlie 额外带待发布变更日志：
+
+```json
+{
+  "positions": {
+    "alpha":   { "offset": 8 },
+    "bravo":   { "cursor": "", "cursor_offset": 7 },
+    "charlie": { "windows": { "2026-11-10T00:00:00Z": 3, "2026-11-11T00:00:00Z": 4 } }
+  },
+  "pending": {
+    "charlie": { "batch_id": "charlie-…-000", "changes": [ … ] }
+  }
+}
+```
+
+`pending` 只在窗口抓取中途崩溃后存在，恢复运行发布成批后即清除；旧版状态文件
+（`window_index`/`window_offset`，无 `windows` 映射与 `pending` 段）可直接打开，
+首轮同步自动迁移。

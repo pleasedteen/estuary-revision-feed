@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"estuary-collector/internal/collector"
+	"estuary-collector/internal/domain"
 	"estuary-collector/internal/mockdata"
 	"estuary-collector/internal/mockserver"
 	"estuary-collector/internal/service"
@@ -680,6 +682,415 @@ func max(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// charlieFetches returns the served charlie page requests as "window@offset"
+// strings for compact assertions.
+func charlieFetches(h *harness) []string {
+	var out []string
+	for _, f := range h.mock.Provider.CharlieFetches() {
+		out = append(out, f.Window+"@"+fmt.Sprint(f.Offset))
+	}
+	return out
+}
+
+// syncThroughStages syncs stage 0 and then advances and syncs n times.
+func syncThroughStages(t *testing.T, h *harness, n int) {
+	t.Helper()
+	rep := h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" {
+			t.Fatalf("stage-0 sync failed: %+v", r)
+		}
+	}
+	for i := 0; i < n; i++ {
+		h.advanceStage()
+		rep = h.sync()
+		for _, r := range rep.Sources {
+			if r.Status != "ok" {
+				t.Fatalf("stage-%d sync failed: %+v", i+1, r)
+			}
+		}
+	}
+}
+
+// Test12_CharlieBackfillAndOldWindowAppend drives stage 4: charlie registers
+// an upload window that sorts before every known window and appends detail
+// rows to an already-consumed window. The round must request only the new
+// ranges, and the appended cross-page reschedule must leave in one batch.
+func Test12_CharlieBackfillAndOldWindowAppend(t *testing.T) {
+	h := newHarness(t)
+	syncThroughStages(t, h, 3)
+
+	h.mock.Provider.ResetCharlieFetches()
+	batchStore, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seqBefore := batchStore.MaxSeq()
+
+	h.advanceStage() // stage 4: backfill window 11-09 + append to window 11-10
+	rep := h.sync()
+	cr := sourceResult(rep, mockdata.InstitutionCharlie)
+	if cr.Status != "ok" {
+		t.Fatalf("charlie stage-4 sync failed: %+v", cr)
+	}
+
+	// Only the new ranges are requested: the whole back-registered window
+	// (2 rows, one page) and offsets 3..6 of the appended old window.
+	want := []string{
+		"2026-11-09T00:00:00Z@0",
+		"2026-11-10T00:00:00Z@3",
+		"2026-11-10T00:00:00Z@5",
+	}
+	if got := charlieFetches(h); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("charlie fetches = %v, want %v", got, want)
+	}
+
+	// Five changes in exactly one new envelope: two backfilled samples, the
+	// appended revision and the two halves of the appended reschedule.
+	envs := h.batchesAfter(seqBefore)
+	if len(envs) != 1 {
+		t.Fatalf("expected exactly one new batch, got %d", len(envs))
+	}
+	changes := envs[0]["changes"].([]any)
+	if len(changes) != 5 {
+		t.Fatalf("expected 5 changes in the batch, got %d", len(changes))
+	}
+	hasOld, hasNew := false, false
+	for _, c := range changes {
+		cm := c.(map[string]any)
+		if cm["institution"] != "charlie" || cm["sample_id"] != "C-302" {
+			continue
+		}
+		if cm["op"] == "withdraw" && cm["sampled_on"] == "2026-11-10" {
+			hasOld = true
+		}
+		if cm["op"] == "upsert" && cm["sampled_on"] == "2026-11-15" {
+			hasNew = true
+		}
+	}
+	if !hasOld || !hasNew {
+		t.Fatal("cross-page reschedule halves of C-302 not in the same batch")
+	}
+
+	recs := materializedMap(h)
+	for _, key := range []string{"charlie|C-308|2026-11-09", "charlie|C-309|2026-11-09"} {
+		if _, ok := recs[key]; !ok {
+			t.Fatalf("backfilled record %s missing", key)
+		}
+	}
+	if _, old := recs["charlie|C-302|2026-11-10"]; old {
+		t.Fatal("C-302 old-day entry still visible after appended reschedule")
+	}
+	if _, ok := recs["charlie|C-302|2026-11-15"]; !ok {
+		t.Fatal("C-302 new-day entry missing after appended reschedule")
+	}
+	if got := recs["charlie|C-300|2026-11-10"]["mg_per_l"]; got != "9.8" {
+		t.Fatalf("appended revision of C-300 not applied: %v", got)
+	}
+
+	// The next round is a no-op: no fetches, no changes.
+	h.mock.Provider.ResetCharlieFetches()
+	rep = h.sync()
+	if cr := sourceResult(rep, mockdata.InstitutionCharlie); cr.Changes != 0 {
+		t.Fatalf("rerun after catch-up produced %d changes", cr.Changes)
+	}
+	if got := charlieFetches(h); len(got) != 0 {
+		t.Fatalf("rerun after catch-up fetched pages: %v", got)
+	}
+}
+
+// Test13_CharlieAppendDuringFetch verifies rows appended to a window while a
+// round is mid-flight are left for the next round, and the next round
+// requests only the appended range.
+func Test13_CharlieAppendDuringFetch(t *testing.T) {
+	h := newHarness(t)
+	// After the first served page, one generated row (C-800) lands in the
+	// 3-row window 11-10 — while the round is fetching it.
+	h.mock.Provider.ArmCharlieAppend("2026-11-10T00:00:00Z", 1)
+
+	rep := h.sync()
+	cr := sourceResult(rep, mockdata.InstitutionCharlie)
+	if cr.Status != "ok" || cr.Changes != 7 {
+		t.Fatalf("first sync should publish the 7 snapshot rows, got %+v", cr)
+	}
+	if _, ok := materializedMap(h)["charlie|C-800|2026-11-10"]; ok {
+		t.Fatal("row appended mid-fetch must be left for the next round")
+	}
+	want := []string{
+		"2026-11-10T00:00:00Z@0",
+		"2026-11-10T00:00:00Z@2",
+		"2026-11-11T00:00:00Z@0",
+		"2026-11-11T00:00:00Z@2",
+	}
+	if got := charlieFetches(h); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("first-round fetches = %v, want %v", got, want)
+	}
+
+	// Next round: only the appended range (offset 3) of the old window is
+	// requested, and the late row is published.
+	h.mock.Provider.ResetCharlieFetches()
+	rep = h.sync()
+	cr = sourceResult(rep, mockdata.InstitutionCharlie)
+	if cr.Status != "ok" || cr.Changes != 1 {
+		t.Fatalf("second sync should publish only the late row, got %+v", cr)
+	}
+	want = []string{"2026-11-10T00:00:00Z@3"}
+	if got := charlieFetches(h); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("second-round fetches = %v, want %v", got, want)
+	}
+	if _, ok := materializedMap(h)["charlie|C-800|2026-11-10"]; !ok {
+		t.Fatal("late row missing after the follow-up round")
+	}
+}
+
+// Test14_CharlieCheckpointResume crashes the charlie run between two pages
+// of an appended window and verifies the restart resumes at the missing
+// page, and that the changes derived before the crash are published in the
+// same single batch as the ones derived after it.
+func Test14_CharlieCheckpointResume(t *testing.T) {
+	h := newHarness(t)
+	syncThroughStages(t, h, 3)
+	h.advanceStage() // stage 4: backfill window + appended cross-page reschedule
+
+	// Crash after the second charlie page of the round (the page carrying
+	// the first half of the C-302 reschedule).
+	var crash sync.Once
+	h.svc.Engine.SetPageHook(func(src string, pageNo int, _ source.Next) {
+		if src == mockdata.InstitutionCharlie && pageNo == 1 {
+			crash.Do(func() { panic("simulated crash mid-window") })
+		}
+	})
+	rep := h.sync()
+	h.svc.Engine.SetPageHook(nil)
+	if cr := sourceResult(rep, mockdata.InstitutionCharlie); cr.Status != "failed" {
+		t.Fatalf("expected crashed charlie run, got %+v", cr)
+	}
+
+	// The crash left a checkpoint: journaled changes under a reserved batch id.
+	st, err := state.Open(filepath.Join(h.dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := st.Pending(mockdata.InstitutionCharlie)
+	if len(pending.Changes) == 0 || pending.BatchID == "" {
+		t.Fatalf("expected a pending journal after the crash, got %+v", pending)
+	}
+	batchStore, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seqBefore := batchStore.MaxSeq()
+
+	// Restart the process and resume.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	h.mock.Provider.ResetCharlieFetches()
+	rep = h.sync()
+	cr := sourceResult(rep, mockdata.InstitutionCharlie)
+	if cr.Status != "ok" {
+		t.Fatalf("resume run failed: %+v", cr)
+	}
+
+	// Only the missing page is fetched — no rescan of completed windows.
+	want := []string{"2026-11-10T00:00:00Z@5"}
+	if got := charlieFetches(h); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("resume fetches = %v, want %v", got, want)
+	}
+
+	// Everything — pre-crash and post-resume changes alike — lands in one
+	// batch under the batch id reserved before the crash.
+	envs := h.batchesAfter(seqBefore)
+	if len(envs) != 1 {
+		t.Fatalf("expected exactly one resumed batch, got %d", len(envs))
+	}
+	if envs[0]["batch_id"] != pending.BatchID {
+		t.Fatalf("resumed batch id %v != journaled %v", envs[0]["batch_id"], pending.BatchID)
+	}
+	changes := envs[0]["changes"].([]any)
+	if len(changes) != 5 {
+		t.Fatalf("resumed batch should hold all 5 changes, got %d", len(changes))
+	}
+	hasOld, hasNew := false, false
+	for _, c := range changes {
+		cm := c.(map[string]any)
+		if cm["sample_id"] != "C-302" {
+			continue
+		}
+		if cm["op"] == "withdraw" && cm["sampled_on"] == "2026-11-10" {
+			hasOld = true
+		}
+		if cm["op"] == "upsert" && cm["sampled_on"] == "2026-11-15" {
+			hasNew = true
+		}
+	}
+	if !hasOld || !hasNew {
+		t.Fatal("reschedule halves separated by the crash not read back from the same batch")
+	}
+	if _, ok := materializedMap(h)["charlie|C-302|2026-11-15"]; !ok {
+		t.Fatal("C-302 new-day entry missing after resume")
+	}
+
+	// The journal is cleared and a rerun is a no-op.
+	st2, err := state.Open(filepath.Join(h.dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := st2.Pending(mockdata.InstitutionCharlie); !p.Empty() {
+		t.Fatalf("pending journal not cleared after resume: %+v", p)
+	}
+	rep = h.sync()
+	if cr := sourceResult(rep, mockdata.InstitutionCharlie); cr.Changes != 0 {
+		t.Fatalf("post-resume rerun produced %d changes", cr.Changes)
+	}
+}
+
+// Test16_CharliePublishedPendingNotReemitted simulates a crash in the narrow
+// window between publishing the batch and clearing the pending journal: the
+// journal still holds an already-published change. The next run must drop it
+// instead of publishing it a second time.
+func Test16_CharliePublishedPendingNotReemitted(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+
+	// Take an already-published charlie change and plant it into the pending
+	// journal, as a crash between publish and journal-clear would leave it.
+	var dup map[string]any
+	for _, c := range allChanges(t, h) {
+		if c["institution"] == "charlie" && c["sample_id"] == "C-300" {
+			dup = c
+			break
+		}
+	}
+	if dup == nil {
+		t.Fatal("expected a published charlie C-300 change")
+	}
+	b, _ := json.Marshal(dup)
+	var ch domain.Change
+	if err := json.Unmarshal(b, &ch); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(filepath.Join(h.dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := st.Get(mockdata.InstitutionCharlie)
+	if err := st.Checkpoint(mockdata.InstitutionCharlie, pos,
+		state.Pending{BatchID: "charlie-crash-window", Changes: []domain.Change{ch}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart: the journaled change is already reflected in the replayed
+	// batch history and must be dropped, and the journal cleared.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	rep := h.sync()
+	if cr := sourceResult(rep, mockdata.InstitutionCharlie); cr.Status != "ok" || cr.Changes != 0 {
+		t.Fatalf("already-published journaled change must not be re-emitted: %+v", cr)
+	}
+	if got := len(allChanges(t, h)); got != 22 {
+		t.Fatalf("published change was re-emitted from the journal: total %d, want 22", got)
+	}
+	st2, err := state.Open(filepath.Join(h.dir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := st2.Pending(mockdata.InstitutionCharlie); !p.Empty() {
+		t.Fatalf("journal not cleared after deduplicated reload: %+v", p)
+	}
+}
+
+// Test15_CharlieStateUpgrade opens a data directory whose state file was
+// written by the previous version (window index + inner offset) and verifies
+// the first run after the upgrade re-reads nothing and republishes nothing,
+// while later stages still flow.
+func Test15_CharlieStateUpgrade(t *testing.T) {
+	h := newHarness(t)
+	h.sync() // stage 0 published with the current format
+
+	// Rewrite the charlie position in the legacy v1 shape: both windows of
+	// the stage-0 directory fully consumed (index past the end).
+	statePath := filepath.Join(h.dir, "state", "state.json")
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	doc["positions"].(map[string]any)["charlie"] = map[string]any{"window_index": 2, "window_offset": 0}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First run after the upgrade: the legacy position is migrated against
+	// the live directory, nothing is re-fetched or republished.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	h.mock.Provider.ResetCharlieFetches()
+	rep := h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" || r.Changes != 0 {
+			t.Fatalf("upgrade run should be an empty ok run: %+v", r)
+		}
+	}
+	if got := charlieFetches(h); len(got) != 0 {
+		t.Fatalf("upgrade run re-fetched pages: %v", got)
+	}
+	if got := len(allChanges(t, h)); got != 22 {
+		t.Fatalf("upgrade republished changes: total %d, want 22", got)
+	}
+	// The persisted position is now the per-window map.
+	pos := loadState(t, h.dir)["charlie"]
+	if pos.Windows == nil || pos.Windows["2026-11-10T00:00:00Z"] != 3 || pos.Windows["2026-11-11T00:00:00Z"] != 4 {
+		t.Fatalf("legacy position not migrated to per-window map: %+v", pos)
+	}
+
+	// Later stages still flow through the migrated position.
+	syncThroughStages(t, h, 4)
+	recs := materializedMap(h)
+	if _, ok := recs["charlie|C-308|2026-11-09"]; !ok {
+		t.Fatal("backfilled window not picked up after upgrade")
+	}
+	if _, ok := recs["charlie|C-302|2026-11-15"]; !ok {
+		t.Fatal("appended reschedule not picked up after upgrade")
+	}
 }
 
 // TestHTTPLayer exercises the real HTTP mux including conflict and

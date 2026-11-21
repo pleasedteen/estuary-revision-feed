@@ -272,6 +272,15 @@ func NewCharlie(baseURL string, tokens *auth.Manager) *CharlieClient {
 	}}
 }
 
+// WindowInfo is one entry of the charlie upload-window directory: the window
+// name and the row count visible at directory-fetch time. A synchronization
+// round treats the fetched list as a snapshot — rows appended to a window
+// after the snapshot stay for the next round.
+type WindowInfo struct {
+	Name     string
+	RowCount int
+}
+
 type windowsResponse struct {
 	Windows []struct {
 		Window   string `json:"window"`
@@ -286,9 +295,11 @@ type charlieResponse struct {
 	Records    []map[string]any `json:"records"`
 }
 
-// FetchWindows returns the current ordered list of upload windows. The list
-// is re-fetched every synchronization so newly opened windows are discovered.
-func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
+// FetchWindows returns the current ordered list of upload windows with their
+// row counts. The list is re-fetched every synchronization so newly opened
+// windows — including ones registered with an earlier sort position — and
+// rows appended to existing windows are discovered.
+func (c *CharlieClient) FetchWindows(ctx context.Context) ([]WindowInfo, error) {
 	_, body, err := c.do(ctx, "/sources/charlie/windows", nil)
 	if err != nil {
 		return nil, err
@@ -297,9 +308,9 @@ func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
 	if err := decode(body, &resp); err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(resp.Windows))
+	out := make([]WindowInfo, 0, len(resp.Windows))
 	for _, w := range resp.Windows {
-		out = append(out, w.Window)
+		out = append(out, WindowInfo{Name: w.Window, RowCount: w.RowCount})
 	}
 	return out, nil
 }

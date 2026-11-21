@@ -9,6 +9,7 @@
 package mockdata
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -38,6 +39,23 @@ type Provider struct {
 	bravo []map[string]any
 	// charlie groups rows by upload window; windows are returned in order.
 	charlie map[string][]map[string]any
+
+	// charlieLate counts generated late-arriving rows (ids C-8xx).
+	charlieLate int
+	// armedWindow/armedRows implement a one-shot mid-fetch append: after the
+	// next charlie page is served, that many generated rows are appended to
+	// the armed window, modeling an upload that lands while a round reads.
+	armedWindow string
+	armedRows   int
+	// charlieFetches records every served charlie page (window + requested
+	// offset) so tests can prove only the new range of a window is read.
+	charlieFetches []CharlieFetch
+}
+
+// CharlieFetch is one served charlie page request.
+type CharlieFetch struct {
+	Window string
+	Offset int
 }
 
 // NewProvider builds the stage-0 dataset.
@@ -65,6 +83,9 @@ func (p *Provider) resetLocked() {
 	p.stage = 0
 	p.alpha = stage0Alpha()
 	p.bravo = stage0Bravo()
+	p.charlieLate = 0
+	p.armedWindow, p.armedRows = "", 0
+	p.charlieFetches = nil
 	p.charlie = map[string][]map[string]any{
 		"2026-11-10T00:00:00Z": {
 			newRow("charlie", "C-300", 1, "2026-11-10", "河口东", "悬浮物", "9.4", "mg/L", "active", "2026-11-10T01:00:00Z"),
@@ -111,6 +132,21 @@ func (p *Provider) Advance() int {
 		)
 		p.bravo = append(p.bravo,
 			oldRow("bravo", "B-200", 2, "2026-11-10", "南港", "悬浮物", "6.8", "mg/L", "A", "2026-11-15T10:00:00Z"),
+		)
+	case 3:
+		// Charlie back-registers an upload window that sorts before every
+		// window seen so far...
+		p.charlie["2026-11-09T00:00:00Z"] = []map[string]any{
+			newRow("charlie", "C-308", 1, "2026-11-09", "河口东", "悬浮物", "4.9", "mg/L", "active", "2026-11-09T01:00:00Z"),
+			newRow("charlie", "C-309", 1, "2026-11-09", "浮标1", "悬浮物", "6.6", "g/m3", "active", "2026-11-09T01:05:00Z"),
+		}
+		// ...and appends detail rows to a window that was already fully read.
+		// The append carries a plain revision plus a reschedule of C-302
+		// whose two halves land on different pages of the window.
+		p.charlie["2026-11-10T00:00:00Z"] = append(p.charlie["2026-11-10T00:00:00Z"],
+			newRow("charlie", "C-300", 2, "2026-11-10", "河口东", "悬浮物", "9.8", "mg/L", "active", "2026-11-16T04:00:00Z"),
+			newRow("charlie", "C-302", 2, "2026-11-10", "河口西", "悬浮物", "7.7", "mg/L", "withdrawn", "2026-11-16T04:05:00Z"),
+			newRow("charlie", "C-302", 3, "2026-11-15", "河口西", "悬浮物", "7.7", "mg/L", "active", "2026-11-16T04:05:01Z"),
 		)
 	}
 	p.stage++
@@ -165,16 +201,65 @@ func (p *Provider) CharlieWindows() []map[string]any {
 	return out
 }
 
-// CharliePage returns one page inside an upload window.
+// CharliePage returns one page inside an upload window. Every request is
+// logged. If a mid-fetch append is armed, it fires right after the page is
+// sliced — the appended rows become visible to later requests but not to a
+// round that already snapshotted the directory.
 func (p *Provider) CharliePage(window string, offset, limit int) (rows []map[string]any, next int, ok bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	all, ok := p.charlie[window]
 	if !ok {
 		return nil, offset, false
 	}
+	p.charlieFetches = append(p.charlieFetches, CharlieFetch{Window: window, Offset: offset})
 	rows, next = slicePage(all, offset, limit)
+	if p.armedWindow != "" {
+		p.appendLateRowsLocked(p.armedWindow, p.armedRows)
+		p.armedWindow, p.armedRows = "", 0
+	}
 	return rows, next, true
+}
+
+// ArmCharlieAppend registers a one-shot append of n generated rows to the
+// given window, fired after the next charlie page is served. It models rows
+// that arrive while a synchronization round is mid-flight.
+func (p *Provider) ArmCharlieAppend(window string, n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.armedWindow, p.armedRows = window, n
+}
+
+// CharlieFetches returns the served charlie page requests so far.
+func (p *Provider) CharlieFetches() []CharlieFetch {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]CharlieFetch, len(p.charlieFetches))
+	copy(out, p.charlieFetches)
+	return out
+}
+
+// ResetCharlieFetches clears the served-page log.
+func (p *Provider) ResetCharlieFetches() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.charlieFetches = nil
+}
+
+// appendLateRowsLocked appends n deterministically generated rows (ids
+// C-800, C-801, ...) to a window. Callers must hold the lock or use the
+// exported wrappers.
+func (p *Provider) appendLateRowsLocked(window string, n int) {
+	day := window
+	if len(day) > len("2026-11-10") {
+		day = day[:len("2026-11-10")]
+	}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("C-8%02d", p.charlieLate)
+		p.charlieLate++
+		p.charlie[window] = append(p.charlie[window],
+			newRow(InstitutionCharlie, id, 1, day, "河口东", "悬浮物", "3.3", "mg/L", "active", window))
+	}
 }
 
 func slicePage(all []map[string]any, offset, limit int) ([]map[string]any, int) {

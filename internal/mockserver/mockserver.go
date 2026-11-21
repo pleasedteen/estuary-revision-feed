@@ -41,16 +41,27 @@ type Server struct {
 	// invalidCursors holds cursor values that must be treated as expired.
 	invalidCursors map[string]bool
 	requestCounts  map[string]*atomic.Int64
+
+	// charlieWindowPage counts inside-window page requests per window since
+	// the last reset (the windows manifest call is counted separately).
+	charlieWindowPage map[string]int
+	// charlieArm models a whole-window retransmission arriving while a
+	// collector is mid-window. armPage > 0 fires once before that page
+	// request; armPage < 0 is sticky and retransmits before every page
+	// request; armPage == 0 means no arm is active.
+	charlieArmWindow string
+	charlieArmPage   int
 }
 
 // New builds a mock server and its initial tokens.
 func New() *Server {
 	s := &Server{
-		Provider:       mockdata.NewProvider(),
-		clients:        map[string]*clientAuth{},
-		rateLimited:    map[string]bool{},
-		invalidCursors: map[string]bool{},
-		requestCounts:  map[string]*atomic.Int64{},
+		Provider:          mockdata.NewProvider(),
+		clients:           map[string]*clientAuth{},
+		rateLimited:       map[string]bool{},
+		invalidCursors:    map[string]bool{},
+		requestCounts:     map[string]*atomic.Int64{},
+		charlieWindowPage: map[string]int{},
 	}
 	s.clients[SharedClient] = &clientAuth{
 		accessToken:  "access-gen1",
@@ -71,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
+	mux.HandleFunc("/mock/control/charlie/retransmit", s.handleCharlieRetransmit)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
 
@@ -230,20 +242,56 @@ func (s *Server) handleCharlieRecords(w http.ResponseWriter, r *http.Request) {
 	window := r.URL.Query().Get("window")
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 	limit := atoiDefault(r.URL.Query().Get("limit"), mockdata.PageLimitCharlie)
-	rows, next, ok := s.Provider.CharliePage(window, offset, limit)
+	// A retransmission armed to happen between pages fires immediately before
+	// the target page request is served. The window date and row count do not
+	// change; only the per-window version (and some revisions) move on.
+	s.maybeFireCharlieArm(window)
+	rows, next, version, ok := s.Provider.CharliePage(window, offset, limit)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown window: "+window)
 		return
 	}
+	s.mu.Lock()
+	s.charlieWindowPage[window]++
+	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"format":      "new",
 		"window":      window,
+		"version":     version,
 		"offset":      offset,
 		"limit":       limit,
 		"next_offset": next,
-		"has_more":    len(rows) == limit,
-		"records":     rows,
+		// Use the real row count rather than len(rows)==limit so a window
+		// whose size is an exact multiple of the page size still terminates
+		// without an extra empty-page round trip.
+		"has_more": next < s.Provider.CharlieLen(window),
+		"records":  rows,
 	})
+}
+
+// maybeFireCharlieArm triggers the armed retransmission. A positive arm
+// fires once on the configured page request; a negative arm is sticky and
+// retransmits before every page request of the window (used to exercise the
+// collector's restart cap).
+func (s *Server) maybeFireCharlieArm(window string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.charlieArmPage == 0 || s.charlieArmWindow != window {
+		return
+	}
+	if s.charlieArmPage < 0 {
+		// Sticky arm: the window changes before every page request.
+		s.Provider.CharlieRetransmit(window)
+		return
+	}
+	// The request about to be served is one past the number served so far.
+	upcoming := s.charlieWindowPage[window] + 1
+	if upcoming != s.charlieArmPage {
+		return
+	}
+	s.charlieArmPage = 0
+	s.charlieArmWindow = ""
+	s.Provider.CharlieRetransmit(window)
 }
 
 // ---------- controls ----------
@@ -291,6 +339,60 @@ func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"expired": req.Cursor})
 }
 
+// handleCharlieRetransmit controls Charlie whole-window retransmissions.
+//
+//	POST /mock/control/charlie/retransmit            retransmit the default
+//	                                                 (first) window immediately
+//	POST ...?window=2026-11-10T00:00:00Z             pick another window
+//	POST ...?arm_page=2                              arm the retransmission to
+//	                                                 fire before the 2nd page
+//	                                                 request of that window
+//	POST ...?arm_page=-1                             sticky arm: retransmit
+//	                                                 before every page request
+//	POST ...?arm_page=0                              disarm a pending arm
+func (s *Server) handleCharlieRetransmit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "2026-11-10T00:00:00Z"
+	}
+	query := r.URL.Query()
+	if query.Has("arm_page") {
+		// arm_page > 0: one-shot before that page request;
+		// arm_page < 0: sticky, retransmit before every page request;
+		// arm_page = 0: disarm any pending arm.
+		armPage := atoiDefault(query.Get("arm_page"), 0)
+		s.mu.Lock()
+		if !s.Provider.CharlieWindowExists(window) {
+			s.mu.Unlock()
+			writeError(w, http.StatusNotFound, "unknown window: "+window)
+			return
+		}
+		s.charlieArmWindow = window
+		s.charlieArmPage = armPage
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"window":     window,
+			"armed_page": armPage,
+			"version":    s.Provider.CharlieVersion(window),
+		})
+		return
+	}
+	version, ok := s.Provider.CharlieRetransmit(window)
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown window: "+window)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window":           window,
+		"version":          version,
+		"retransmit_count": s.Provider.CharlieRetransmitCount(),
+	})
+}
+
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -300,6 +402,9 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.rateLimited = map[string]bool{}
 	s.invalidCursors = map[string]bool{}
+	s.charlieWindowPage = map[string]int{}
+	s.charlieArmWindow = ""
+	s.charlieArmPage = 0
 	for _, c := range s.requestCounts {
 		c.Store(0)
 	}
@@ -322,10 +427,12 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	c := s.clients[SharedClient]
 	c.mu.Lock()
 	stats := map[string]any{
-		"stage":            s.Provider.Stage(),
-		"rate_limited":     rl,
-		"token_generation": c.generation,
-		"refresh_count":    c.refreshCount,
+		"stage":                        s.Provider.Stage(),
+		"rate_limited":                 rl,
+		"token_generation":             c.generation,
+		"refresh_count":                c.refreshCount,
+		"charlie_retransmit_count":     s.Provider.CharlieRetransmitCount(),
+		"charlie_window_page_requests": s.charlieWindowPageSnapshot(),
 	}
 	c.mu.Unlock()
 	s.mu.RUnlock()
@@ -343,6 +450,15 @@ func (s *Server) isRateLimited(source string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.rateLimited[source]
+}
+
+// charlieWindowPageSnapshot returns a copy of the per-window page counters.
+func (s *Server) charlieWindowPageSnapshot() map[string]int {
+	out := map[string]int{}
+	for k, v := range s.charlieWindowPage {
+		out[k] = v
+	}
+	return out
 }
 
 // consumeCursorInvalid reports whether a cursor is expired and clears the

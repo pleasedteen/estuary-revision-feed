@@ -41,12 +41,12 @@ say() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 pass() { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
 fail() { printf '  \033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
-say "1/9 构建两个本地服务二进制"
+say "1/10 构建两个本地服务二进制"
 go build -o "$WORK/mocksrv" ./cmd/mocksrv
 go build -o "$WORK/collector" ./cmd/collector
 pass "build ok"
 
-say "2/9 运行 Go 测试（含 -race 核心包）"
+say "2/10 运行 Go 测试（含 -race 核心包）"
 go test ./... -timeout 60s >/dev/null
 go test -race ./internal/... ./tests/ -timeout 90s >/dev/null
 pass "all Go tests + race detector pass"
@@ -65,9 +65,17 @@ pass "mock + collector are up"
 sync() { curl -sf -X POST "$COL_BASE/v1/sync"; }
 source_field() { jq -r --arg s "$1" --arg f "$2" '.sources[] | select(.source==$s) | .[$f]'; }
 
-say "3/9 首轮同步：三种分页（偏移/游标/时间窗）一次性采集"
+say "3/10 预置 Charlie 整窗重传：在首个窗的两页之间触发（窗日期与条数不变，版本号递增）"
+# Charlie 首个上传窗有 3 行、每页 2 行，共两页。arm_page=2 让模拟源在
+# 第 2 个分页请求到来前先完成整窗重传，再把新版本页面返回给采集器。
+ARM="$(curl -sf -X POST "$MOCK_BASE/mock/control/charlie/retransmit?window=2026-11-10T00:00:00Z&arm_page=2")"
+echo "  armed: $(echo "$ARM" | jq -c .)"
+[ "$(echo "$ARM" | jq -r .armed_page)" = "2" ] || fail "failed to arm charlie retransmission"
+pass "retransmission armed to fire between the two pages of the first window"
+
+say "4/10 首轮同步：三种分页（偏移/游标/时间窗）一次性采集"
 R="$(sync)"
-echo "$R" | jq -r '.sources[] | "  - \(.source): status=\(.status) pages=\(.pages_fetched) seen=\(.records_seen) changes=\(.changes)"'
+echo "$R" | jq -r '.sources[] | "  - \(.source): status=\(.status) pages=\(.pages_fetched) seen=\(.records_seen) changes=\(.changes) window_restart=\(.window_restart // false)"'
 for s in alpha bravo charlie; do
   [ "$(echo "$R" | source_field "$s" status)" = "ok" ] || fail "source $s not ok"
 done
@@ -75,7 +83,23 @@ TOTAL="$(curl -sf "$COL_BASE/v1/status" | jq -r .max_seq)"
 [ "$TOTAL" = "22" ] || fail "expected 22 initial changes, got $TOTAL"
 pass "22 initial records collected across all three pagination styles"
 
-say "4/9 新旧格式与单位统一（g/m³ 与 mg/L 等价换算，字段统一）"
+# 重传窗口的采集语义：
+#   1) 引擎报告 window_restart（两页之间检测到版本变化并整窗重读）；
+#   2) C-300 只以重传后的 rev2 出现，绝不混发 rev1（不混版）；
+#   3) 重传窗已确认后，再同步只查窗清单、零分页请求、零变更。
+[ "$(echo "$R" | source_field charlie window_restart)" = "true" ] || fail "mid-pages retransmission not detected"
+C300_REVS="$(jq -s '[.[] | .changes[]? | select(.sample_id=="C-300") | .revision] | sort | unique' "$DATA/batches/batches.jsonl" | tr -d ' \n')"
+[ "$C300_REVS" = "[2]" ] || fail "mixed window versions published for C-300: $C300_REVS"
+pass "retransmitted revision captured; C-300 published only as rev2 (no mixed versions)"
+PAGES_BEFORE="$(curl -sf "$MOCK_BASE/mock/stats" | jq -r '.request_counts.charlie')"
+R="$(sync)"
+[ "$(echo "$R" | source_field charlie changes)" = "0" ] || fail "confirmed window rerun emitted changes"
+[ "$(echo "$R" | source_field charlie pages_fetched)" = "0" ] || fail "confirmed window rerun issued page requests"
+PAGES_AFTER="$(curl -sf "$MOCK_BASE/mock/stats" | jq -r '.request_counts.charlie')"
+[ "$((PAGES_AFTER-PAGES_BEFORE))" = "1" ] || fail "confirmed window must be checked via manifest only"
+pass "confirmed unchanged window: manifest-only check, zero page requests, no duplicate emission"
+
+say "5/10 新旧格式与单位统一（g/m³ 与 mg/L 等价换算，字段统一）"
 curl -sf "$COL_BASE/v1/records" | jq -r '
   (.records[] | select(.sample_id=="A-102" or .sample_id=="B-200" or .sample_id=="C-302"))
   | "  - \(.institution)/\(.sample_id): \(.mg_per_l) \(.unit) @ \(.location) [\(.material)]"'
@@ -83,7 +107,7 @@ BAD="$(curl -sf "$COL_BASE/v1/records" | jq '[.records[] | select(.unit!="mg/L")
 [ "$BAD" = "0" ] || fail "some records are not canonicalized to mg/L"
 pass "all concentrations canonicalized to mg/L with unified field names"
 
-say "5/9 进入下一数据阶段：修订 / 撤回 / 改期 / 新增"
+say "6/10 进入下一数据阶段：修订 / 撤回 / 改期 / 新增"
 curl -sf -X POST "$MOCK_BASE/mock/control/stage" >/dev/null
 R="$(sync)"
 echo "$R" | jq -r '.sources[] | "  - \(.source): changes=\(.changes)"'
@@ -95,14 +119,14 @@ SAME_BATCH="$(jq -s --arg id A-101 '[.[] | select((.changes|map(select(.sample_i
 pass "A-101 reschedule published as withdraw+upsert in one batch"
 curl -sf "$COL_BASE/v1/records" | jq -r '.records[] | select(.sample_id=="A-101") | "  - A-101 now archived on \(.sampled_on)"'
 
-say "6/9 幂等：再同步一次不应产生任何新变更"
+say "7/10 幂等：再同步一次不应产生任何新变更"
 R="$(sync)"
 EXTRA="$(echo "$R" | jq '[.sources[].changes] | add')"
 [ "$EXTRA" = "0" ] || fail "rerun produced changes: $EXTRA"
 SEQ_BEFORE="$(curl -sf "$COL_BASE/v1/status" | jq -r .max_seq)"
 pass "repeat sync is a no-op (max_seq stays $SEQ_BEFORE)"
 
-say "7/9 限流隔离：限流 alpha 时 bravo 与 charlie 继续采集"
+say "8/10 限流隔离：限流 alpha 时 bravo 与 charlie 继续采集"
 curl -sf -X POST "$MOCK_BASE/mock/control/ratelimit?source=alpha&on=true" >/dev/null
 R="$(sync)"
 echo "$R" | jq -r '.sources[] | "  - \(.source): status=\(.status)"'
@@ -112,7 +136,7 @@ echo "$R" | jq -r '.sources[] | "  - \(.source): status=\(.status)"'
 curl -sf -X POST "$MOCK_BASE/mock/control/ratelimit?source=alpha&on=false" >/dev/null
 pass "rate-limited source isolated; other sources completed"
 
-say "8/9 游标过期 + 撤回防复活 + 共享令牌只刷新一次"
+say "9/10 游标过期 + 撤回防复活 + 共享令牌只刷新一次"
 # 让当前共享令牌失效（模拟一代令牌到期），随后采集器的一次刷新应被两家共用
 REFRESH_BEFORE="$(curl -sf "$MOCK_BASE/mock/stats" | jq -r .refresh_count)"
 curl -sf -X POST "$MOCK_BASE/auth/token" -H 'Content-Type: application/json' \
@@ -138,7 +162,7 @@ REFRESH_AFTER="$(curl -sf "$MOCK_BASE/mock/stats" | jq -r .refresh_count)"
 [ "$((REFRESH_AFTER-REFRESH_BEFORE))" = "2" ] || fail "expected manual + single collector refresh, delta=$((REFRESH_AFTER-REFRESH_BEFORE))"
 pass "exactly one collector-side token refresh shared by alpha and charlie"
 
-say "9/9 下游续读：保存 next_seq 后只读到新增批次"
+say "10/10 下游续读：保存 next_seq 后只读到新增批次"
 FIRST="$(curl -sf "$COL_BASE/v1/batches?after_seq=0&limit=1")"
 SAVED="$(echo "$FIRST" | jq -r .next_seq)"
 PAGE="$(curl -sf "$COL_BASE/v1/batches?after_seq=$SAVED")"

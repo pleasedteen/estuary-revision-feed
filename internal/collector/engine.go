@@ -41,6 +41,12 @@ type indexEntry struct {
 	record    *domain.CanonicalRecord
 }
 
+// maxWindowRestarts bounds how many times a single Charlie window may be
+// re-read after mid-window retransmissions within one run, so an upstream
+// that retransmits on every request fails the run explicitly instead of
+// looping forever.
+const maxWindowRestarts = 16
+
 // SourceResult summarizes one source's run.
 type SourceResult struct {
 	Source        string `json:"source"`
@@ -50,6 +56,10 @@ type SourceResult struct {
 	Changes       int    `json:"changes"`
 	BatchID       string `json:"batch_id,omitempty"`
 	CursorRestart bool   `json:"cursor_restart,omitempty"`
+	// WindowRestart is set when a Charlie whole-window retransmission was
+	// detected between pages: the window was re-read from its first page so
+	// no two versions of one window ever land in the same published batch.
+	WindowRestart bool   `json:"window_restart,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
@@ -367,6 +377,103 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 }
 
 // ---------- charlie: upload-time windows ----------
+//
+// Charlie occasionally retransmits a whole upload window: the window date and
+// the number of rows stay identical, but some rows carry higher revisions —
+// and the retransmission can land between two pages of an ongoing read.
+//
+// The rules implemented here are:
+//
+//   - The window manifest carries a monotonic per-window version. A window
+//     already confirmed at the same version is skipped after the manifest
+//     check (no page requests at all). A retransmitted window (new version)
+//     is read again, so higher revisions are always picked up.
+//   - While reading a window, the version is pinned from the manifest. Every
+//     page echoes the serving version; a mismatch means the window changed
+//     mid-read, so the whole window is restarted from its first page.
+//   - Changes of one reading attempt are derived against a private overlay
+//     and only merged into the shared index (and published) once the window
+//     has been read cover-to-cover at one version. Pages of two versions of
+//     the same window can therefore never be mixed into one batch.
+//   - On crash or restart the same on-disk data directory is reused. Only
+//     fully confirmed windows are checkpointed, so an interrupted window is
+//     re-read from the head and already-published revisions are absorbed by
+//     the monotonic revision index.
+
+// windowRead accumulates one window reading attempt without touching the
+// shared index, guaranteeing that a retransmission between pages cannot
+// publish a mixture of two window versions. It is discarded wholesale when
+// the window version changes mid-read.
+type windowRead struct {
+	changes []domain.Change
+	overlay map[string]*indexEntry
+}
+
+func newWindowRead() *windowRead {
+	return &windowRead{overlay: map[string]*indexEntry{}}
+}
+
+// deriveInto applies one raw record to the window overlay instead of the
+// shared index. The shared index still supplies the baseline, so revisions
+// already published by earlier runs keep suppressing stale re-reads.
+func (e *Engine) deriveInto(w *windowRead, raw map[string]any) (*domain.Change, error) {
+	rec, err := normalize.Record(raw)
+	if err != nil {
+		return nil, err
+	}
+	key := rec.Key()
+
+	e.idxMu.Lock()
+	defer e.idxMu.Unlock()
+	if existing, ok := w.overlay[key]; ok {
+		if rec.Revision <= existing.revision {
+			return nil, nil
+		}
+	} else if existing, known := e.index[key]; known && rec.Revision <= existing.revision {
+		return nil, nil
+	}
+
+	var ch *domain.Change
+	if rec.Withdrawn {
+		ch = &domain.Change{
+			Op:          domain.OpWithdraw,
+			Institution: rec.Institution,
+			SampleID:    rec.SampleID,
+			SampledOn:   rec.SampledOn,
+			Revision:    rec.Revision,
+		}
+		w.overlay[key] = &indexEntry{revision: rec.Revision, withdrawn: true}
+	} else {
+		cp := rec
+		ch = &domain.Change{
+			Op:          domain.OpUpsert,
+			Institution: rec.Institution,
+			SampleID:    rec.SampleID,
+			SampledOn:   rec.SampledOn,
+			Revision:    rec.Revision,
+			Record:      &cp,
+		}
+		w.overlay[key] = &indexEntry{revision: rec.Revision, record: &cp}
+	}
+	w.changes = append(w.changes, *ch)
+	return ch, nil
+}
+
+// commitWindow merges a fully read, single-version window into the shared
+// index and the run's change list.
+func (e *Engine) commitWindow(w *windowRead, changes []domain.Change) []domain.Change {
+	e.idxMu.Lock()
+	defer e.idxMu.Unlock()
+	for key, ent := range w.overlay {
+		cp := *ent
+		if ent.record != nil {
+			rec := *ent.record
+			cp.record = &rec
+		}
+		e.index[key] = &cp
+	}
+	return append(changes, w.changes...)
+}
 
 func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 	res.Source = mockdata.InstitutionCharlie
@@ -377,52 +484,92 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 		res.Status, res.Error = classifyError(err)
 		return res
 	}
-	windowIndex := pos.WindowIndex
-	if windowIndex > len(windows) {
-		windowIndex = len(windows)
+
+	// Confirmed windows keyed by window date, carrying the read version.
+	confirmed := make(map[string]int64, len(pos.Windows))
+	for _, cp := range pos.Windows {
+		confirmed[cp.Window] = cp.Version
 	}
-	windowOffset := pos.WindowOffset
+
 	var changes []domain.Change
 	run := 0
+	// checkpoints collects this run's fully confirmed windows, preserving the
+	// manifest order and every window confirmed earlier at the same version.
+	checkpoints := make([]state.WindowCheckpoint, 0, len(windows))
 
-	for windowIndex < len(windows) {
-		window := windows[windowIndex]
-		for {
+	for _, win := range windows {
+		if ver, ok := confirmed[win.Window]; ok && ver == win.Version {
+			// Window already fully read at exactly this version: the manifest
+			// alone proves nothing changed, so no page request is needed.
+			checkpoints = append(checkpoints, state.WindowCheckpoint{Window: win.Window, Version: ver})
+			continue
+		}
+
+		// Read this window cover-to-cover, pinned to the manifest version.
+		pinned := win.Version
+		for attempt := 0; attempt < maxWindowRestarts+1; attempt++ {
 			if err := ctx.Err(); err != nil {
 				res.Status, res.Error = "interrupted", err.Error()
 				return res
 			}
-			page, err := e.charlie.FetchWindowPage(ctx, window, windowOffset)
-			if err != nil {
-				res.Status, res.Error = classifyError(err)
-				return res
-			}
-			res.PagesFetched++
-			for _, raw := range page.Records {
-				res.RecordsSeen++
-				ch, derr := e.derive(raw)
-				if derr != nil {
-					res.Status, res.Error = "failed", derr.Error()
+			read := newWindowRead()
+			windowOffset := 0
+			restarted := false
+			for {
+				page, err := e.charlie.FetchWindowPage(ctx, win.Window, windowOffset)
+				if err != nil {
+					res.Status, res.Error = classifyError(err)
 					return res
 				}
-				if ch != nil {
-					changes = append(changes, *ch)
+				res.PagesFetched++
+				// A retransmission between pages changes the served version.
+				// Drop everything read under the old version and restart the
+				// window from its first page rather than mixing the two.
+				if page.Position.WindowVersion != pinned {
+					res.WindowRestart = true
+					restarted = true
+					pinned = page.Position.WindowVersion
+					break
+				}
+				for _, raw := range page.Records {
+					res.RecordsSeen++
+					if _, derr := e.deriveInto(read, raw); derr != nil {
+						res.Status, res.Error = "failed", derr.Error()
+						return res
+					}
+				}
+				if e.hookAfterPage != nil {
+					e.hookAfterPage(mockdata.InstitutionCharlie, run, page.Position)
+				}
+				windowOffset = page.Position.WindowOffset
+				run++
+				if page.Done {
+					break
 				}
 			}
-			if e.hookAfterPage != nil {
-				e.hookAfterPage(mockdata.InstitutionCharlie, run, page.Position)
-			}
-			windowOffset = page.Position.WindowOffset
-			run++
-			if page.Done {
-				windowIndex++
-				windowOffset = 0
+			if !restarted {
+				// Whole window read at one version: safe to publish.
+				changes = e.commitWindow(read, changes)
+				checkpoints = append(checkpoints, state.WindowCheckpoint{Window: win.Window, Version: pinned})
 				break
+			}
+			if attempt == maxWindowRestarts {
+				res.Status, res.Error = "failed",
+					fmt.Sprintf("charlie window %s changed version more than %d times while reading", win.Window, maxWindowRestarts)
+				return res
 			}
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), changes,
-		state.Position{WindowIndex: windowIndex, WindowOffset: windowOffset})
+
+	// Legacy positional fields are kept for older readers; the authoritative
+	// resume data is the ordered list of confirmed windows.
+	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie,
+		e.newBatchID(mockdata.InstitutionCharlie, run), changes,
+		state.Position{
+			WindowIndex:  len(checkpoints),
+			WindowOffset: 0,
+			Windows:      checkpoints,
+		})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res

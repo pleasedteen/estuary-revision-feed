@@ -12,6 +12,17 @@ import (
 	"sync"
 )
 
+// WindowCheckpoint records one Charlie upload window that has been fully
+// read and whose changes were durably published.
+type WindowCheckpoint struct {
+	// Window is the upload-window date (the stable window identity).
+	Window string `json:"window"`
+	// Version is the window version at read time. A whole-window
+	// retransmission bumps the version, so a changed window is re-read even
+	// though its date and row count are unchanged.
+	Version int64 `json:"version"`
+}
+
 // Position is a generic read position covering all three pagination styles.
 // Only the fields relevant to a source are used.
 type Position struct {
@@ -26,6 +37,11 @@ type Position struct {
 	WindowIndex int `json:"window_index,omitempty"`
 	// ...and the next row offset inside that window.
 	WindowOffset int `json:"window_offset,omitempty"`
+	// Window source: every fully processed upload window together with the
+	// version it was read at. Windows already confirmed at the same version
+	// are skipped after a manifest-only check; a retransmitted window (new
+	// version) is read again. Keyed by window date for stable persistence.
+	Windows []WindowCheckpoint `json:"windows,omitempty"`
 }
 
 // File is the on-disk state container.

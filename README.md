@@ -11,7 +11,7 @@
 |------|----------|------|----------|
 | alpha | 偏移分页 `offset/limit` | 共享短期令牌 | 新格式 |
 | bravo | 不透明游标分页，过期后需从头回读（会重放旧修订） | 静态 Bearer | 旧格式 |
-| charlie | 上传时间窗 + 窗内多页 | 共享短期令牌 | 新格式 |
+| charlie | 上传时间窗 + 窗内多页；同一窗可能整窗重传（日期与条数不变、版本号递增） | 共享短期令牌 | 新格式 |
 
 alpha 与 charlie **共用同一代短期访问令牌**：一代令牌失效后，采集服务对认证端
 **只发起一次刷新**，并发的 401 调用合并等待同一次刷新结果（见
@@ -32,8 +32,8 @@ internal/state       每来源读取位置，原子写盘，支持断点续传
 internal/store       JSON Lines 批次存储：全局 seq、原子追加、按位置续读
 internal/collector   采集引擎：修订判定、撤回防复活、改期同批、崩溃恢复
 internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status）
-tests                端到端测试（11 个场景 + HTTP 层测试）
-scripts/verify.sh    一条命令完成的可复现验证（约 3 秒）
+tests                端到端测试（16 个场景 + HTTP 层测试）
+scripts/verify.sh    一条命令完成的可复现验证（约 2 秒）
 ```
 
 ## 快速开始
@@ -89,19 +89,24 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 curl -X POST http://127.0.0.1:18081/mock/control/stage     # 推进一个数据阶段
 curl -X POST "http://127.0.0.1:18081/mock/control/ratelimit?source=alpha&on=true"
 curl -X POST http://127.0.0.1:18081/mock/control/reset      # 全部复位
-curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等
+# Charlie 整窗重传：窗日期与条数不变，版本号 +1，其中一条携带更高修订
+curl -X POST "http://127.0.0.1:18081/mock/control/charlie/retransmit?window=2026-11-10T00:00:00Z"
+# 预置重传：在该窗第 arm_page 个分页请求到来前自动触发，模拟读到两页之间赶上重传
+curl -X POST "http://127.0.0.1:18081/mock/control/charlie/retransmit?window=2026-11-10T00:00:00Z&arm_page=2"
+curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数/重传次数等
 ```
 
-## 一条命令的可复现验证（目标 80 秒内，实测约 3 秒）
+## 一条命令的可复现验证（目标 80 秒内，实测约 2 秒）
 
 ```bash
 scripts/verify.sh
 ```
 
 脚本会构建二进制、运行全部 Go 测试（核心包带 `-race`），再通过真实 HTTP 接口
-依次演示：三种分页首轮采集、新旧格式与 `g/m³ → mg/L` 统一、修订/撤回/改期同批、
-幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、崩溃后续跑以及下游
-按保存位置续读。依赖安装时间不计入。
+依次演示：三种分页首轮采集（含在 Charlie 两页之间触发的整窗重传：更高修订被
+采到且不混版发布、已确认窗只查清单）、新旧格式与 `g/m³ → mg/L` 统一、
+修订/撤回/改期同批、幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防
+复活、崩溃后续跑以及下游按保存位置续读。依赖安装时间不计入。
 
 只跑 Go 测试：
 
@@ -143,9 +148,12 @@ go test -race ./...      # 含竞态检测
   **再**保存下一页的读取位置；位置落盘同样是临时文件 + 原子替换。
 - 进程重启后，记录索引通过**重放全部已发布批次**重建，序号计数器扫描批次文件
   恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
+- Charlie 的检查点是**已确认窗清单**（窗日期 + 读到的窗版本），而非易失的窗
+  下标：未读完的窗不进检查点，重启后整窗重读；重传窗靠版本号识别而不是位置。
 - 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
   `seq > after_seq`，文件轮转不影响旧位置。
-对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
+对应测试：`Test10_InterruptResume`、`Test14_CharlieRetransmitCrashResume`、
+`Test6_DownstreamReadPosition`。
 
 ### 6. 限流隔离与令牌刷新
 
@@ -154,6 +162,30 @@ go test -race ./...      # 含竞态检测
 共享令牌的 401 在客户端透明刷新一次后重试，刷新由 `auth.Manager` 单飞合并，
 同一代令牌失效无论多少并发调用都只产生一次刷新请求。
 对应测试：`Test8_TokenSingleRefresh`、`Test9_RateLimitIsolation`。
+
+### 7. Charlie 整窗重传：采到更高修订但绝不混版
+
+Charlie 偶尔会把**整个上传窗重传一遍**：窗日期（`window`）与条数都和原来
+一样，只有部分记录携带更高修订号，重传甚至可能在采集器读到该窗两页之间
+到达。模拟源为每个窗维护单调递增的 `version`（清单与每个分页都会回传）。
+
+- **已确认且内容没变的窗只查清单**：状态里保存每个已完成窗读到的版本号；
+  清单显示版本未变时直接跳过，一个分页请求都不发。
+- **重传里的更高修订必须采到**：清单版本变大就整窗重读，修订号更大的记录
+  再次产生变更；其余未变行因修订号未涨而被忽略。
+- **不能把同一窗两版的分页混着发布**：读窗期间把版本固定在清单版本上；
+  一旦某个分页回传的版本与固定版本不一致，立刻丢弃本次已读内容并从该窗
+  第一页重读（报告中 `window_restart=true`）。每个窗的变更先在私有覆盖层
+  推导，整窗按同一版本读完后才合并发布，所以一个批次里绝不会出现两版
+  混排。
+- **读到一半失败/重启**：只有完整读完的窗才写入检查点。中断的窗重启后
+  从头重读；已发布批次仍是权威记录，回读到的旧修订被单调修订索引吸收，
+  不会重复发布。
+- 其他两家来源与 Charlie 重传互不影响；数据阶段推进（改期等）仍从同一批
+  读取，改期两半仍在同一批次发布。
+对应测试：`Test12_CharlieRetransmitImmediate`、
+`Test13_CharlieRetransmitBetweenPages`、`Test14_CharlieRetransmitCrashResume`、
+`Test15_CharlieRetransmitWithStageProgress`、`Test16_CharlieRetransmitStormFailsFast`。
 
 ## 数据文件格式
 

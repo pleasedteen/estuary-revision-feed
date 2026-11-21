@@ -39,6 +39,10 @@ type Next struct {
 	CursorOffset int    `json:"cursor_offset,omitempty"`
 	WindowIndex  int    `json:"window_index,omitempty"`
 	WindowOffset int    `json:"window_offset,omitempty"`
+	// WindowVersion is the version of the Charlie window that served a page.
+	// It lets the collector notice a whole-window retransmission landing
+	// between two pages of the same reading attempt.
+	WindowVersion int64 `json:"window_version,omitempty"`
 }
 
 // RateLimitedError wraps HTTP 429.
@@ -272,23 +276,35 @@ func NewCharlie(baseURL string, tokens *auth.Manager) *CharlieClient {
 	}}
 }
 
+// CharlieWindow describes one entry of the Charlie window manifest: the
+// window date, its current retransmission version and the row count, which
+// stays identical across retransmissions.
+type CharlieWindow struct {
+	Window   string
+	Version  int64
+	RowCount int
+}
+
 type windowsResponse struct {
 	Windows []struct {
 		Window   string `json:"window"`
 		RowCount int    `json:"row_count"`
+		Version  int64  `json:"version"`
 	} `json:"windows"`
 }
 
 type charlieResponse struct {
 	Window     string           `json:"window"`
+	Version    int64            `json:"version"`
 	NextOffset int              `json:"next_offset"`
 	HasMore    bool             `json:"has_more"`
 	Records    []map[string]any `json:"records"`
 }
 
-// FetchWindows returns the current ordered list of upload windows. The list
-// is re-fetched every synchronization so newly opened windows are discovered.
-func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
+// FetchWindows returns the current ordered upload windows together with
+// their versions. The list is re-fetched every synchronization so newly
+// opened windows and whole-window retransmissions are discovered.
+func (c *CharlieClient) FetchWindows(ctx context.Context) ([]CharlieWindow, error) {
 	_, body, err := c.do(ctx, "/sources/charlie/windows", nil)
 	if err != nil {
 		return nil, err
@@ -297,14 +313,15 @@ func (c *CharlieClient) FetchWindows(ctx context.Context) ([]string, error) {
 	if err := decode(body, &resp); err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(resp.Windows))
+	out := make([]CharlieWindow, 0, len(resp.Windows))
 	for _, w := range resp.Windows {
-		out = append(out, w.Window)
+		out = append(out, CharlieWindow{Window: w.Window, Version: w.Version, RowCount: w.RowCount})
 	}
 	return out, nil
 }
 
-// FetchWindowPage returns one page inside an upload window.
+// FetchWindowPage returns one page inside an upload window. The page carries
+// the window's current version so a retransmission between pages is visible.
 func (c *CharlieClient) FetchWindowPage(ctx context.Context, window string, offset int) (Page, error) {
 	q := url.Values{}
 	q.Set("window", window)
@@ -319,8 +336,11 @@ func (c *CharlieClient) FetchWindowPage(ctx context.Context, window string, offs
 		return Page{}, err
 	}
 	return Page{
-		Records:  resp.Records,
-		Position: Next{WindowOffset: resp.NextOffset},
-		Done:     !resp.HasMore,
+		Records: resp.Records,
+		Position: Next{
+			WindowOffset:  resp.NextOffset,
+			WindowVersion: resp.Version,
+		},
+		Done: !resp.HasMore,
 	}, nil
 }

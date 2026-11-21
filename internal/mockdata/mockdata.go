@@ -9,6 +9,7 @@
 package mockdata
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -38,11 +39,22 @@ type Provider struct {
 	bravo []map[string]any
 	// charlie groups rows by upload window; windows are returned in order.
 	charlie map[string][]map[string]any
+	// charlieVersion carries a monotonically increasing version per window.
+	// A whole-window retransmission replaces every row of the window and
+	// bumps its version while the window date and row count stay identical,
+	// which models Charlie re-sending the same upload window (possibly while
+	// a collector is paging through it).
+	charlieVersion map[string]int64
+	// charlieRetransmitCount counts how many retransmissions have occurred.
+	charlieRetransmitCount int64
 }
 
 // NewProvider builds the stage-0 dataset.
 func NewProvider() *Provider {
-	p := &Provider{charlie: map[string][]map[string]any{}}
+	p := &Provider{
+		charlie:        map[string][]map[string]any{},
+		charlieVersion: map[string]int64{},
+	}
 	p.resetLocked()
 	return p
 }
@@ -78,6 +90,11 @@ func (p *Provider) resetLocked() {
 			newRow("charlie", "C-306", 1, "2026-11-11", "浮标2", "悬浮物", "5.5", "mg/L", "active", "2026-11-11T02:15:00Z"),
 		},
 	}
+	p.charlieVersion = map[string]int64{
+		"2026-11-10T00:00:00Z": 1,
+		"2026-11-11T00:00:00Z": 1,
+	}
+	p.charlieRetransmitCount = 0
 }
 
 // Advance applies the next deterministic stage and returns the new number.
@@ -96,6 +113,7 @@ func (p *Provider) Advance() int {
 			newRow("charlie", "C-301", 3, "2026-11-14", "河口东", "悬浮物", "11.2", "mg/L", "active", "2026-11-12T03:00:01Z"),
 			newRow("charlie", "C-307", 1, "2026-11-12", "浮标2", "悬浮物", "8.9", "mg/L", "active", "2026-11-12T03:05:00Z"),
 		}
+		p.charlieVersion["2026-11-12T00:00:00Z"] = 1
 	case 1:
 		p.alpha = append(p.alpha,
 			newRow("alpha", "A-102", 2, "2026-11-11", "北滩", "悬浮物", "16.3", "g/m3", "active", "2026-11-13T09:00:00Z"),
@@ -146,7 +164,10 @@ func (p *Provider) BravoPage(offset, limit int) (rows []map[string]any, nextOffs
 	return slicePage(p.bravo, offset, limit)
 }
 
-// CharlieWindows returns the ordered upload windows and their row counts.
+// CharlieWindows returns the ordered upload windows and their row counts and
+// current window versions. The version starts at 1 and increases by one on
+// every whole-window retransmission; the window date and row count stay the
+// same, so an unchanged window is identifiable from the manifest alone.
 func (p *Provider) CharlieWindows() []map[string]any {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -160,21 +181,83 @@ func (p *Provider) CharlieWindows() []map[string]any {
 		out = append(out, map[string]any{
 			"window":    k,
 			"row_count": len(p.charlie[k]),
+			"version":   p.charlieVersion[k],
 		})
 	}
 	return out
 }
 
-// CharliePage returns one page inside an upload window.
-func (p *Provider) CharliePage(window string, offset, limit int) (rows []map[string]any, next int, ok bool) {
+// CharliePage returns one page inside an upload window together with the
+// window's current version, which lets the collector detect a retransmission
+// that happened between pages of the same reading attempt.
+func (p *Provider) CharliePage(window string, offset, limit int) (rows []map[string]any, next int, version int64, ok bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	all, ok := p.charlie[window]
 	if !ok {
-		return nil, offset, false
+		return nil, offset, 0, false
 	}
 	rows, next = slicePage(all, offset, limit)
-	return rows, next, true
+	return rows, next, p.charlieVersion[window], true
+}
+
+// CharlieWindowExists reports whether the given upload window is served.
+func (p *Provider) CharlieWindowExists(window string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.charlie[window]
+	return ok
+}
+
+// CharlieLen returns the current number of rows in one upload window
+// (0 for an unknown window).
+func (p *Provider) CharlieLen(window string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.charlie[window])
+}
+
+// CharlieVersion returns the current version of one window (0 when unknown).
+func (p *Provider) CharlieVersion(window string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.charlieVersion[window]
+}
+
+// CharlieRetransmitCount reports how many whole-window retransmissions have
+// happened since the last reset.
+func (p *Provider) CharlieRetransmitCount() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.charlieRetransmitCount
+}
+
+// CharlieRetransmit replaces the whole content of the given upload window
+// with a retransmitted edition: the window date and the row count stay
+// identical while one record carries a higher revision and the window version
+// is bumped. It models Charlie re-sending an entire window. The new version
+// number is returned; retransmitting an unknown window reports ok=false.
+func (p *Provider) CharlieRetransmit(window string) (int64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.charlie[window]; !ok {
+		return 0, false
+	}
+	version := p.charlieVersion[window] + 1
+	p.charlieVersion[window] = version
+	p.charlieRetransmitCount++
+	// The retransmitted C-300 revision tracks the window version (the initial
+	// window is version 1 with C-300 at revision 1, so version N carries
+	// revision N), and its measurement changes every time. The other rows keep
+	// their revision numbers so re-reading them must not produce changes.
+	c300 := newRow("charlie", "C-300", version, "2026-11-10", "河口东", "悬浮物",
+		fmt.Sprintf("9.%d", 7+version), "mg/L", "active", "2026-11-13T01:00:00Z")
+	p.charlie[window] = []map[string]any{
+		c300,
+		newRow("charlie", "C-301", 1, "2026-11-10", "河口东", "悬浮物", "11.2", "mg/L", "active", "2026-11-10T01:05:00Z"),
+		newRow("charlie", "C-302", 1, "2026-11-10", "河口西", "悬浮物", "7.7", "g/m3", "active", "2026-11-10T01:10:00Z"),
+	}
+	return version, true
 }
 
 func slicePage(all []map[string]any, offset, limit int) ([]map[string]any, int) {

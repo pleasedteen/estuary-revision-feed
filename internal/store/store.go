@@ -5,17 +5,22 @@
 // have seen and pass it back on the next read, so batches remain available
 // for multiple independent consumers and read positions never expire.
 //
-// Writes are crash-safe: a batch is fully rendered into a temporary file and
-// renamed into place only once, so an interrupted sync can never leave a
-// half-written line behind. On restart the highest sequence is rebuilt by
-// scanning the batch directory, making the batches themselves the
-// authoritative durability record.
+// Writes are crash-safe: a batch becomes visible only once its complete line
+// (including the trailing newline) has been written and fsynced. A write that
+// fails halfway is rolled back to the previous file size; if the process dies
+// before that rollback, the next Open detects the trailing fragment (anything
+// after the last newline) and truncates it away. Consequently an interrupted
+// append never corrupts earlier batches and never exposes a partial batch.
+// On restart the highest sequence is rebuilt by scanning the complete lines,
+// making the batches themselves the authoritative durability record.
 package store
 
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,14 +38,25 @@ const (
 	activeName  = "batches.jsonl"
 )
 
+// WriteFault is a test hook that can shorten or fail a batch append. It
+// receives the fully rendered line (including the trailing newline) and
+// returns how many bytes should actually reach the file plus an optional
+// error. Returning n < len(line) simulates a short write; returning a
+// non-nil error makes Publish treat the append as failed and roll back the
+// partial prefix. Passing nil removes the hook.
+type WriteFault func(line []byte) (n int, err error)
+
 // Store owns the batches directory and the sequence counter.
 type Store struct {
 	dir string
-	mu  sync.Mutex
+	mu  sync.RWMutex
 
 	nextSeq  int64
 	active   *os.File
 	activeSz int64
+
+	faultMu    sync.Mutex
+	writeFault WriteFault
 }
 
 // Open prepares the batches directory and rebuilds the sequence counter.
@@ -56,7 +72,11 @@ func Open(dir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, _ := f.Stat()
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
 	s.active = f
 	s.activeSz = info.Size()
 	return s, nil
@@ -72,9 +92,23 @@ func (s *Store) Close() error {
 	return nil
 }
 
+// SetWriteFault installs (or clears) the test hook used to exercise disk
+// write failures. It is safe to call at any time.
+func (s *Store) SetWriteFault(fn WriteFault) {
+	s.faultMu.Lock()
+	s.writeFault = fn
+	s.faultMu.Unlock()
+}
+
+func (s *Store) getWriteFault() WriteFault {
+	s.faultMu.Lock()
+	defer s.faultMu.Unlock()
+	return s.writeFault
+}
+
 // Publish appends one batch containing changes and returns the envelope that
 // was written. Empty change sets are not written. The whole batch becomes
-// visible atomically.
+// visible atomically: either the complete line is durable or nothing is.
 func (s *Store) Publish(batchID string, changes []domain.Change) (domain.Envelope, error) {
 	if len(changes) == 0 {
 		return domain.Envelope{}, nil
@@ -105,12 +139,40 @@ func (s *Store) Publish(batchID string, changes []domain.Change) (domain.Envelop
 			return domain.Envelope{}, err
 		}
 	}
-	if _, err := s.active.Write(line); err != nil {
-		return domain.Envelope{}, err
+
+	startSz := s.activeSz
+	n := len(line)
+	var writeErr error
+	if hook := s.getWriteFault(); hook != nil {
+		n, writeErr = hook(line)
+		if n < 0 {
+			n = 0
+		}
+		if n > len(line) {
+			n = len(line)
+		}
 	}
-	if err := s.active.Sync(); err != nil {
-		return domain.Envelope{}, err
+	if n > 0 {
+		if _, werr := s.active.Write(line[:n]); werr != nil && writeErr == nil {
+			writeErr = werr
+		}
 	}
+	if n != len(line) && writeErr == nil {
+		// A short write would leave a fragment; treat it as a failed append.
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = s.active.Sync()
+	}
+	if writeErr != nil {
+		// Remove any partial prefix so an in-process retry appends a clean
+		// line. If this rollback fails, restart recovery drops the tail.
+		if terr := s.active.Truncate(startSz); terr == nil {
+			_ = s.active.Sync()
+		}
+		return domain.Envelope{}, writeErr
+	}
+
 	s.nextSeq += int64(len(changes))
 	s.activeSz += int64(len(line))
 	return env, nil
@@ -121,40 +183,32 @@ func (s *Store) Publish(batchID string, changes []domain.Change) (domain.Envelop
 // first batch file, so any saved downstream position remains valid even when
 // the collector restarted and rotated files.
 func (s *Store) ReadAfter(afterSeq int64, limit int) ([]domain.Envelope, error) {
-	s.mu.Lock()
-	names := s.batchFilesLocked()
-	s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	var out = make([]domain.Envelope, 0)
-	for _, name := range names {
-		f, err := os.Open(filepath.Join(s.dir, name))
-		if err != nil {
-			return nil, err
-		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
+	names := s.batchFilesLocked()
+	out := make([]domain.Envelope, 0)
+	for i, name := range names {
+		last := i == len(names)-1
+		err := scanLines(filepath.Join(s.dir, name), last, func(line []byte) error {
 			var env domain.Envelope
-			if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
-				f.Close()
-				return nil, fmt.Errorf("corrupt batch line in %s: %w", name, err)
+			if err := json.Unmarshal(line, &env); err != nil {
+				return fmt.Errorf("corrupt batch line in %s: %w", name, err)
 			}
 			// Filter at change granularity: an envelope may straddle the
 			// saved position even when its first sequence is not past it.
 			kept := keepChangesAfter(env, afterSeq)
 			if len(kept.Changes) > 0 {
 				out = append(out, kept)
-				if limit > 0 && len(out) >= limit {
-					f.Close()
-					return out, nil
-				}
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			f.Close()
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
-		f.Close()
+		if limit > 0 && len(out) >= limit {
+			return out[:limit], nil
+		}
 	}
 	return out, nil
 }
@@ -172,45 +226,111 @@ func keepChangesAfter(env domain.Envelope, afterSeq int64) domain.Envelope {
 
 // MaxSeq returns the highest sequence that has been published (0 if empty).
 func (s *Store) MaxSeq() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.nextSeq - 1
 }
 
-// rebuild scans every JSONL file and recovers the next sequence number.
+// rebuild scans every JSONL file and recovers the next sequence number. An
+// incomplete trailing append in the active file (anything after the last
+// newline) is truncated away: such a batch was never acknowledged, so it
+// must not become visible. Complete lines remain authoritative.
 func (s *Store) rebuild() error {
 	names, err := s.batchFiles()
 	if err != nil {
 		return err
 	}
 	var maxSeq int64
-	for _, name := range names {
-		f, err := os.Open(filepath.Join(s.dir, name))
+	for i, name := range names {
+		last := i == len(names)-1
+		got, err := scanFileRebuilding(filepath.Join(s.dir, name), last)
 		if err != nil {
 			return err
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
+		if got > maxSeq {
+			maxSeq = got
+		}
+	}
+	s.nextSeq = maxSeq + 1
+	return nil
+}
+
+// scanLines invokes fn for each newline-terminated line in path. A trailing
+// fragment without a newline is ignored when allowIncompleteTail is true;
+// otherwise it is reported as corruption (an archived file must be complete).
+func scanLines(path string, allowIncompleteTail bool, fn func(line []byte) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	br := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, rerr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			if line[len(line)-1] != '\n' {
+				if allowIncompleteTail {
+					return nil
+				}
+				return fmt.Errorf("incomplete trailing line in %s", path)
+			}
+			if ferr := fn(line[:len(line)-1]); ferr != nil {
+				return ferr
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return nil
+			}
+			return rerr
+		}
+	}
+}
+
+// scanFileRebuilding returns the highest sequence in path and truncates an
+// unfinished trailing append from the last (active) file.
+func scanFileRebuilding(path string, allowIncompleteTail bool) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	var maxSeq int64
+	var offset int64
+	br := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, rerr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			if line[len(line)-1] != '\n' {
+				if !allowIncompleteTail {
+					return 0, fmt.Errorf("incomplete trailing line in %s", path)
+				}
+				// The batch was never fully appended; drop the fragment.
+				if terr := os.Truncate(path, offset); terr != nil {
+					return 0, terr
+				}
+				return maxSeq, nil
+			}
 			var env domain.Envelope
-			if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
-				f.Close()
-				return fmt.Errorf("corrupt batch line in %s: %w", name, err)
+			if jerr := json.Unmarshal(line[:len(line)-1], &env); jerr != nil {
+				return 0, fmt.Errorf("corrupt batch line in %s at offset %d: %w", path, offset, jerr)
 			}
 			for _, c := range env.Changes {
 				if c.Seq > maxSeq {
 					maxSeq = c.Seq
 				}
 			}
+			offset += int64(len(line))
 		}
-		if err := scanner.Err(); err != nil {
-			f.Close()
-			return err
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return maxSeq, nil
+			}
+			return 0, rerr
 		}
-		f.Close()
 	}
-	s.nextSeq = maxSeq + 1
-	return nil
 }
 
 func (s *Store) rotateLocked() error {

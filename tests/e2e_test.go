@@ -785,3 +785,350 @@ func TestHTTPLayer(t *testing.T) {
 }
 
 var _ = source.Page{}
+
+// requestCount returns how many requests the mock has served for a source.
+func requestCount(h *harness, source string) int64 {
+	stats := h.mockGet("/mock/stats")
+	counts := stats["request_counts"].(map[string]any)
+	return int64(counts[source].(float64))
+}
+
+// Test12_PageTwoRateLimitHidesStagedChanges covers the headline bug: a source
+// whose first page succeeds and whose second page is rate limited must not
+// expose the revisions from the completed first page before the run finishes.
+// After the limit is lifted the retry must still emit those changes, so no
+// upstream update is lost, while the other sources complete independently.
+func Test12_PageTwoRateLimitHidesStagedChanges(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	h.advanceStage()
+
+	// Stage 1 appends five alpha rows; the saved offset points at them, so
+	// the first page already carries three fresh revisions (A-100 rev2 and
+	// both halves of the A-101 reschedule). Enable the 429 only after that
+	// first page, so page 2 fails with staged changes in hand.
+	h.svc.Engine.SetPageHook(func(src string, pageNo int, _ source.Next) {
+		if src == mockdata.InstitutionAlpha && pageNo == 0 {
+			h.mockPost("/mock/control/ratelimit?source=alpha&on=true", map[string]any{})
+		}
+	})
+
+	rep := h.sync()
+	ar := sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "rate_limited" {
+		t.Fatalf("alpha should be rate limited on page 2, got %+v", ar)
+	}
+	if ar.PagesFetched != 1 {
+		t.Fatalf("alpha should have fetched exactly one page before the limit, got %d", ar.PagesFetched)
+	}
+	if ar.Changes != 0 {
+		t.Fatalf("a rate-limited source must not report published changes, got %d", ar.Changes)
+	}
+	// Other sources completed despite alpha's failure.
+	for _, name := range []string{mockdata.InstitutionBravo, mockdata.InstitutionCharlie} {
+		if r := sourceResult(rep, name); r.Status != "ok" {
+			t.Fatalf("%s should complete independently: %+v", name, r)
+		}
+	}
+	// Crucially, nothing from alpha's incomplete run is visible: the finished
+	// first page stays staged behind the failed second page.
+	after := materializedMap(h)
+	if rec := after["alpha|A-100|2026-11-10"]; rec["revision"].(float64) != 1 {
+		t.Fatalf("A-100 exposed rev %v while alpha was still rate limited", rec["revision"])
+	}
+	if _, leaked := after["alpha|A-101|2026-11-12"]; leaked {
+		t.Fatal("A-101 new-day insert leaked from an unfinished alpha run")
+	}
+	if _, leaked := after["alpha|A-108|2026-11-12"]; leaked {
+		t.Fatal("A-108 new sample leaked from an unfinished alpha run")
+	}
+	// The reschedule's withdrawal half must not be visible on its own either:
+	// A-101 stays on its old day until the whole batch publishes.
+	if _, ok := after["alpha|A-101|2026-11-10"]; !ok {
+		t.Fatal("A-101 left its old day before the reschedule was published")
+	}
+
+	// Lift the limit: the retry must emit exactly the previously-staged work
+	// (all five alpha stage-1 changes) and lose nothing.
+	h.mockPost("/mock/control/ratelimit?source=alpha&on=false", map[string]any{})
+	h.svc.Engine.SetPageHook(nil)
+	rep = h.sync()
+	ar = sourceResult(rep, mockdata.InstitutionAlpha)
+	if ar.Status != "ok" {
+		t.Fatalf("alpha retry failed: %+v", ar)
+	}
+	if ar.Changes != 5 {
+		t.Fatalf("retry must emit all five staged alpha changes, got %d", ar.Changes)
+	}
+	recs := materializedMap(h)
+	if recs["alpha|A-100|2026-11-10"]["revision"].(float64) != 2 {
+		t.Fatalf("A-100 revision 2 lost after retry: %v", recs["alpha|A-100|2026-11-10"])
+	}
+	if _, ok := recs["alpha|A-101|2026-11-12"]; !ok {
+		t.Fatal("A-101 reschedule lost after retry")
+	}
+	if _, ok := recs["alpha|A-108|2026-11-12"]; !ok {
+		t.Fatal("A-108 new sample lost after retry")
+	}
+	// Downstream sees A-100 exactly once at revision 2, never a transient.
+	var rev2Upserts int
+	for _, c := range allChanges(t, h) {
+		if c["institution"] == "alpha" && c["sample_id"] == "A-100" && c["op"] == "upsert" && c["revision"].(float64) == 2 {
+			rev2Upserts++
+		}
+	}
+	if rev2Upserts != 1 {
+		t.Fatalf("A-100 rev2 should be published exactly once, got %d", rev2Upserts)
+	}
+	// A follow-up run is a clean no-op.
+	rep = h.sync()
+	for _, r := range rep.Sources {
+		if r.Changes != 0 {
+			t.Fatalf("post-recovery rerun not empty: %+v", r)
+		}
+	}
+}
+
+// Test13_PartialBatchCrashResume verifies a crash while writing a batch leaves
+// earlier complete batches readable, never exposes the unfinished batch, and
+// lets a restart finish the source from its last saved position.
+func Test13_PartialBatchCrashResume(t *testing.T) {
+	h := newHarness(t)
+
+	// Fail the second batch publish (charlie's initial batch) after a short
+	// prefix hits the file. The first batch is already complete and must
+	// survive; the truncated tail must never become visible.
+	var fails atomic.Int64
+	batchDir := filepath.Join(h.dir, "batches")
+	h.svc.Engine.SetStoreWriteFault(func(line []byte) (int, error) {
+		if fails.Add(1) == 2 {
+			return len(line) / 3, nil // short write: half a batch reaches disk
+		}
+		return len(line), nil
+	})
+
+	// The engine reports the failing source as failed while the others finish.
+	rep := h.svc.Engine.Sync(context.Background())
+	var failed int
+	for _, r := range rep.Sources {
+		switch r.Status {
+		case "ok":
+		case "failed":
+			failed++
+		default:
+			t.Fatalf("unexpected source status: %+v", r)
+		}
+	}
+	if failed == 0 {
+		t.Fatalf("expected one source to fail its batch write, got %+v", rep.Sources)
+	}
+	h.svc.Engine.SetStoreWriteFault(nil)
+
+	// A fresh process sees only fully written batches and no corrupt tail.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatalf("restart on partially written batches: %v", err)
+	}
+	h.svc = svc2
+	bs2, err := store.Open(batchDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bs2.ReadAfter(0, 0); err != nil {
+		t.Fatalf("completed batches unreadable after partial write: %v", err)
+	}
+	preSeq := bs2.MaxSeq()
+	if preSeq == 0 {
+		t.Fatal("expected at least one completed batch before the crash")
+	}
+
+	// The restart finishes every source; each record is published exactly
+	// once across the whole incident.
+	rep = h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" {
+			t.Fatalf("resume run not ok for %s: %+v", r.Source, r)
+		}
+	}
+	recs := materializedMap(h)
+	if len(recs) != 22 {
+		t.Fatalf("expected all 22 initial records after resume, got %d", len(recs))
+	}
+	seen := map[string]int{}
+	total := 0
+	for _, c := range allChanges(t, h) {
+		total++
+		if c["op"] == "upsert" {
+			seen[fmt.Sprintf("%v|%v|%v|%v", c["institution"], c["sample_id"], c["sampled_on"], c["revision"])]++
+		}
+	}
+	for key, n := range seen {
+		if n != 1 {
+			t.Fatalf("record revision %s published %d times across crash/resume", key, n)
+		}
+	}
+	// Reopen so the counter reflects every batch written after the restart.
+	finalStore, err := store.Open(batchDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalStore.MaxSeq() != int64(total) {
+		t.Fatalf("sequence gap after resume: max=%d changes=%d", finalStore.MaxSeq(), total)
+	}
+}
+
+// Test14_PublishedBatchCheckpointFailure verifies that when the batch is
+// published but saving the read position fails, the batch stays visible, an
+// in-process retry does not duplicate it, and a restart (which re-reads from
+// the stale position) also does not duplicate it. Old downstream bookmarks
+// keep working and sequence numbers stay monotonic.
+func Test14_PublishedBatchCheckpointFailure(t *testing.T) {
+	h := newHarness(t)
+
+	// Publish everything, then capture a downstream position before the
+	// stage-1 changes.
+	h.sync()
+	st, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envs, err := st.ReadAfter(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bookmark := envs[len(envs)-1].Seq
+	preMax := st.MaxSeq()
+
+	h.advanceStage()
+
+	// Fail the checkpoint for exactly one source once. Its batch publishes,
+	// but its position is not saved.
+	var once sync.Once
+	h.svc.Engine.SetCheckpointHook(func(src string, _ state.Position) error {
+		failed := false
+		once.Do(func() { failed = true })
+		if failed {
+			return fmt.Errorf("injected state write failure for %s", src)
+		}
+		return nil
+	})
+	rep := h.sync()
+	failedSrc := ""
+	for _, r := range rep.Sources {
+		if r.Status == "failed" {
+			failedSrc = r.Source
+		}
+	}
+	if failedSrc == "" {
+		t.Fatalf("expected one source to report a checkpoint failure, got %+v", rep.Sources)
+	}
+	h.svc.Engine.SetCheckpointHook(nil)
+
+	// The published batch is visible even though the position failed.
+	midMax := func() int64 {
+		s2, err := store.Open(filepath.Join(h.dir, "batches"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s2.MaxSeq()
+	}()
+	if midMax <= preMax {
+		t.Fatalf("published batch not visible after checkpoint failure: max %d -> %d", preMax, midMax)
+	}
+	if _, ok := materializedMap(h)["alpha|A-100|2026-11-10"]; !ok {
+		t.Fatal("records view lost data after checkpoint failure")
+	}
+
+	// Same-process retry: the source re-reads from the stale position, but the
+	// revision index already reflects the published batch, so nothing repeats.
+	rep = h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" {
+			t.Fatalf("retry after checkpoint failure not ok: %+v", r)
+		}
+		if r.Changes != 0 {
+			t.Fatalf("retry of %s duplicated %d changes", r.Source, r.Changes)
+		}
+	}
+	afterRetry := midMaxSeq(t, h)
+	if afterRetry != midMax {
+		t.Fatalf("same-process retry emitted new batches: %d -> %d", midMax, afterRetry)
+	}
+
+	// Restart: the rebuild replays published batches, and the stale position
+	// makes the failed source re-read pages whose revisions are now known.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	rep = h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" || r.Changes != 0 {
+			t.Fatalf("post-restart replay duplicated work for %s: %+v", r.Source, r)
+		}
+	}
+	if got := midMaxSeq(t, h); got != midMax {
+		t.Fatalf("restart replay emitted new batches: %d -> %d", midMax, got)
+	}
+
+	// Old downstream bookmark still reads a contiguous, monotonic stream.
+	batchStore, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cont, err := batchStore.ReadAfter(bookmark, 0)
+	if err != nil {
+		t.Fatalf("old bookmark unreadable: %v", err)
+	}
+	var last int64 = bookmark
+	total := 0
+	for _, env := range cont {
+		for _, c := range env.Changes {
+			if c.Seq <= last {
+				t.Fatalf("sequence not monotonic: %d after %d", c.Seq, last)
+			}
+			last = c.Seq
+			total++
+		}
+	}
+	if total == 0 {
+		t.Fatal("old bookmark saw no stage-1 changes")
+	}
+	// No (record, revision) pair is published twice across the whole incident.
+	upserts := map[string]int{}
+	for _, c := range allChanges(t, h) {
+		if c["op"] == "upsert" {
+			upserts[fmt.Sprintf("%v|%v|%v|%v", c["institution"], c["sample_id"], c["sampled_on"], c["revision"])]++
+		}
+	}
+	for key, n := range upserts {
+		if n != 1 {
+			t.Fatalf("%s upserted %d times across checkpoint failure", key, n)
+		}
+	}
+}
+
+// midMaxSeq returns the current maximum sequence on disk.
+func midMaxSeq(t *testing.T, h *harness) int64 {
+	t.Helper()
+	s, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.MaxSeq()
+}

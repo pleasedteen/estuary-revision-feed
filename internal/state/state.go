@@ -72,11 +72,24 @@ func (s *Store) Get(source string) Position {
 }
 
 // Update changes one source position and flushes the whole file atomically.
+// The in-memory position is only replaced after the new file is durably in
+// place, so a failed write leaves memory and disk agreeing on the previous
+// position. A retry after such a failure therefore re-reads from the same
+// point and, because those revisions are already published, emits nothing.
 func (s *Store) Update(source string, pos Position) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prev, had := s.file.Positions[source]
 	s.file.Positions[source] = pos
-	return s.flushLocked()
+	if err := s.flushLocked(); err != nil {
+		if had {
+			s.file.Positions[source] = prev
+		} else {
+			delete(s.file.Positions, source)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) flushLocked() error {

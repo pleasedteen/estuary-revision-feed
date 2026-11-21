@@ -32,7 +32,7 @@ internal/state       每来源读取位置，原子写盘，支持断点续传
 internal/store       JSON Lines 批次存储：全局 seq、原子追加、按位置续读
 internal/collector   采集引擎：修订判定、撤回防复活、改期同批、崩溃恢复
 internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status）
-tests                端到端测试（11 个场景 + HTTP 层测试）
+tests                端到端测试（14 个场景 + HTTP 层测试）
 scripts/verify.sh    一条命令完成的可复现验证（约 3 秒）
 ```
 
@@ -139,21 +139,34 @@ go test -race ./...      # 含竞态检测
 
 ### 5. 断点续传与崩溃恢复
 
-- 每抓完一页先发布批次（临时文件 + `rename` 原子落盘，`fsync` 后返回），
-  **再**保存下一页的读取位置；位置落盘同样是临时文件 + 原子替换。
+- **先在内存里暂存，发布成功后才生效**：单个来源一轮内抓到的所有页先只作用在
+  该来源私有的暂存视图上，不修改对外的记录索引。因此抓完第一页、第二页却遇到
+  429 时，已抓页的修订不会提前出现在 `/v1/records` 或 `/v1/batches` 里，读取
+  位置也不前进；解除限流后重试会重新抓同样的页并产生同样的变更，一条都不漏。
+- **整批原子落盘**：一个来源一轮的变更写成一个 JSONL 信封（临时渲染 + 追加
+  + `fsync`），只有完整的整行（含结尾换行）落盘后该批次才可见。写到一半失败
+  会回滚到写入前的长度；若进程在回滚前崩溃，重启扫描时会把最后一个换行之后的
+  残片截掉。已完成的批次始终可读，未完成的批次不会对外。
+- **先发布、再保存位置，顺序不可颠倒**：批次落盘后才更新该来源的读取位置。若
+  位置保存失败，批次仍保留（其对索引的影响已经在落盘后提交），内存中的位置
+  同时回退到旧值。同进程重试或重启都会从旧位置重读这些页，但修订号已不大于
+  已知值，因此不会重复生成变更。
 - 进程重启后，记录索引通过**重放全部已发布批次**重建，序号计数器扫描批次文件
-  恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
+  恢复。
 - 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
   `seq > after_seq`，文件轮转不影响旧位置。
-对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
+对应测试：`Test10_InterruptResume`、`Test13_PartialBatchCrashResume`、
+`Test14_PublishedBatchCheckpointFailure`、`Test6_DownstreamReadPosition`。
 
 ### 6. 限流隔离与令牌刷新
 
-三个来源在同一轮同步中以独立 goroutine 运行；429 被包装成
-`RateLimitedError`，只让该来源本轮标记为 `rate_limited`，其余两个继续完成。
+三个来源在同一轮同步中以独立 goroutine 运行，各自拥有独立的暂存视图；429 被
+包装成 `RateLimitedError`，只让该来源本轮标记为 `rate_limited` 并丢弃其暂存
+变更（其余来源的批次照常发布），下一轮重试时该来源从原读取位置重新采全。
 共享令牌的 401 在客户端透明刷新一次后重试，刷新由 `auth.Manager` 单飞合并，
 同一代令牌失效无论多少并发调用都只产生一次刷新请求。
-对应测试：`Test8_TokenSingleRefresh`、`Test9_RateLimitIsolation`。
+对应测试：`Test8_TokenSingleRefresh`、`Test9_RateLimitIsolation`、
+`Test12_PageTwoRateLimitHidesStagedChanges`。
 
 ## 数据文件格式
 

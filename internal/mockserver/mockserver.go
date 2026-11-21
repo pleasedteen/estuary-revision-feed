@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"estuary-collector/internal/mockdata"
 )
@@ -41,6 +42,12 @@ type Server struct {
 	// invalidCursors holds cursor values that must be treated as expired.
 	invalidCursors map[string]bool
 	requestCounts  map[string]*atomic.Int64
+	// bulkPageSize overrides the served page size of a source (used to keep
+	// a large revision backlog on a realistically small number of pages).
+	bulkPageSize map[string]int
+	// bulkDelayMs adds artificial per-page latency to a source, modeling a
+	// slow institution with a large backlog.
+	bulkDelayMs map[string]int
 }
 
 // New builds a mock server and its initial tokens.
@@ -51,6 +58,8 @@ func New() *Server {
 		rateLimited:    map[string]bool{},
 		invalidCursors: map[string]bool{},
 		requestCounts:  map[string]*atomic.Int64{},
+		bulkPageSize:   map[string]int{},
+		bulkDelayMs:    map[string]int{},
 	}
 	s.clients[SharedClient] = &clientAuth{
 		accessToken:  "access-gen1",
@@ -71,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
+	mux.HandleFunc("/mock/control/bulk", s.handleBulk)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
 
@@ -169,6 +179,7 @@ func bearer(r *http.Request) string {
 func (s *Server) handleAlpha(w http.ResponseWriter, r *http.Request) {
 	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
 	limit := atoiDefault(r.URL.Query().Get("limit"), mockdata.PageLimitAlpha)
+	limit = s.effectivePage(mockdata.InstitutionAlpha, limit)
 	rows, next := s.Provider.AlphaPage(offset, limit)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"format":      "new",
@@ -178,6 +189,21 @@ func (s *Server) handleAlpha(w http.ResponseWriter, r *http.Request) {
 		"has_more":    next < s.Provider.AlphaLen(),
 		"records":     rows,
 	})
+}
+
+// effectivePage applies the bulk page-size override and per-page latency
+// configured through /mock/control/bulk.
+func (s *Server) effectivePage(source string, limit int) int {
+	s.mu.RLock()
+	bulk, delay := s.bulkPageSize[source], s.bulkDelayMs[source]
+	s.mu.RUnlock()
+	if bulk > limit {
+		limit = bulk
+	}
+	if delay > 0 {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+	}
+	return limit
 }
 
 // ---------- source: bravo (cursor) ----------
@@ -291,6 +317,51 @@ func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"expired": req.Cursor})
 }
 
+// handleBulk appends a deterministic revision backlog to a source and
+// optionally enlarges its served page size and per-page latency. Used by the
+// memory-bounded sync/recovery verification.
+func (s *Server) handleBulk(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		Source      string `json:"source"`
+		Samples     int    `json:"samples"`
+		Revisions   int    `json:"revisions"`
+		PageSize    int    `json:"page_size"`
+		PageDelayMs int    `json:"page_delay_ms"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	if req.Source != mockdata.InstitutionAlpha {
+		writeError(w, http.StatusBadRequest, "bulk backlog is only supported for alpha")
+		return
+	}
+	if req.Samples <= 0 || req.Revisions <= 0 {
+		writeError(w, http.StatusBadRequest, "samples and revisions must be positive")
+		return
+	}
+	rows := s.Provider.AppendBulkRevisions(req.Samples, req.Revisions)
+	s.mu.Lock()
+	if req.PageSize > 0 {
+		s.bulkPageSize[req.Source] = req.PageSize
+	}
+	if req.PageDelayMs > 0 {
+		s.bulkDelayMs[req.Source] = req.PageDelayMs
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"source":        req.Source,
+		"rows_appended": rows,
+		"stream_len":    s.Provider.AlphaLen(),
+		"page_size":     req.PageSize,
+		"page_delay_ms": req.PageDelayMs,
+	})
+}
+
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -300,6 +371,8 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.rateLimited = map[string]bool{}
 	s.invalidCursors = map[string]bool{}
+	s.bulkPageSize = map[string]int{}
+	s.bulkDelayMs = map[string]int{}
 	for _, c := range s.requestCounts {
 		c.Store(0)
 	}

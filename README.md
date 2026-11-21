@@ -24,16 +24,18 @@ cmd/collector        采集服务主程序（HTTP 接口 + 编排引擎）
 cmd/mocksrv          三家机构 + 认证端的本地模拟服务（确定性数据）
 internal/domain      统一后的规范记录、变更、批次信封类型
 internal/normalize   新旧两种响应格式识别、字段名与浓度单位统一
-internal/mockdata    可复现的分阶段数据集（修订/改期/撤回/旧修订重放）
+internal/mockdata    可复现的分阶段数据集（修订/改期/撤回/旧修订重放/积压造数）
 internal/mockserver  模拟 HTTP 接口（三种分页、401/410/429、控制端点）
 internal/auth        共享令牌管理器（单飞刷新，同代只刷一次）
 internal/source      三个来源的 HTTP 客户端（401 重试、429/410 分类错误）
 internal/state       每来源读取位置，原子写盘，支持断点续传
-internal/store       JSON Lines 批次存储：全局 seq、原子追加、按位置续读
+internal/store       JSON Lines 批次存储：全局 seq、流式整批发布、按位置续读
 internal/collector   采集引擎：修订判定、撤回防复活、改期同批、崩溃恢复
-internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status）
-tests                端到端测试（11 个场景 + HTTP 层测试）
-scripts/verify.sh    一条命令完成的可复现验证（约 3 秒）
+internal/memstats    Go 堆高水位采样器（内存有界验证）
+internal/service     HTTP 装配（/v1/sync、/v1/batches、/v1/records、/v1/status、/debug/mem）
+tests                端到端测试（12 个场景 + HTTP 层测试）
+scripts/verify.sh        一条命令完成的可复现验证（约 30 秒）
+scripts/verify_memory.sh 64 MiB 积压下的堆峰值专项验证（打印两个峰值）
 ```
 
 ## 快速开始
@@ -79,9 +81,14 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 | `GET /v1/records` | 当前可见（未撤回）的规范记录快照 |
 | `GET /v1/batches?after_seq=N&limit=M` | 从位置 N 续读，返回 `next_seq` |
 | `POST /v1/sync` | 触发一轮同步 |
+| `GET /debug/mem` | Go 堆高水位（进程启动以来 / 上次重置以来） |
+| `POST /debug/mem/reset` | GC 后重置高水位，返回稳态基线 |
 
-批次直接落盘在 `-data` 目录：`batches/batches.jsonl`（每行一个批次信封，
-超过 1 MiB 自动轮转为 `batch-NNNN.jsonl`），读取位置在 `state/state.json`。
+批次直接落盘在 `-data` 目录：每个批次一个文件
+`batches/env-<首seq>-<末seq>-<batchID>.jsonl`（单行信封，与旧格式同形状，
+先写临时文件再原子改名发布）；读取位置在 `state/state.json`。旧版本写
+出的 `batches.jsonl` 与轮转归档 `batch-NNNN.jsonl` 仍可被正常读取、
+参与恢复与去重，已发出的 `seq` 书签在新旧文件混排时依然有效。
 
 ### 模拟源控制端点（仅模拟服务提供）
 
@@ -89,10 +96,13 @@ curl "http://127.0.0.1:18080/v1/batches?after_seq=34"
 curl -X POST http://127.0.0.1:18081/mock/control/stage     # 推进一个数据阶段
 curl -X POST "http://127.0.0.1:18081/mock/control/ratelimit?source=alpha&on=true"
 curl -X POST http://127.0.0.1:18081/mock/control/reset      # 全部复位
+curl -X POST http://127.0.0.1:18081/mock/control/bulk \     # 造积压：少量样本反复修订
+  -H 'Content-Type: application/json' \
+  -d '{"source":"alpha","samples":8,"revisions":220000,"page_size":5000,"page_delay_ms":25}'
 curl http://127.0.0.1:18081/mock/stats                      # 刷新次数/请求计数等
 ```
 
-## 一条命令的可复现验证（目标 80 秒内，实测约 3 秒）
+## 一条命令的可复现验证（目标 80 秒内，实测约 30 秒）
 
 ```bash
 scripts/verify.sh
@@ -100,13 +110,25 @@ scripts/verify.sh
 
 脚本会构建二进制、运行全部 Go 测试（核心包带 `-race`），再通过真实 HTTP 接口
 依次演示：三种分页首轮采集、新旧格式与 `g/m³ → mg/L` 统一、修订/撤回/改期同批、
-幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、崩溃后续跑以及下游
-按保存位置续读。依赖安装时间不计入。
+幂等重跑、限流隔离、共享令牌单次刷新、游标过期头回读防复活、崩溃后续跑、下游
+按保存位置续读，最后调用 `scripts/verify_memory.sh` 做内存有界验证。依赖安装
+时间不计入。
+
+### 内存有界验证（≥64 MiB 积压，两个堆峰值）
+
+```bash
+scripts/verify_memory.sh
+```
+
+本地造数：8 个采样号反复修订 22 万次（≥64 MiB 变更，含一对改期），随后一条
+命令完成：慢源采集期间其他来源先行发布、整批发布与改期同批、旧 JSONL 与已发
+书签续读、重启恢复，并打印**同步**与**重启恢复**两个额外 Go 堆峰值（预算各
+32 MiB，实测约 12 MiB / 4 MiB）。
 
 只跑 Go 测试：
 
 ```bash
-go test ./...            # 功能测试
+go test ./...            # 功能测试（含 64 MiB 堆峰值回归测试 Test12）
 go test -race ./...      # 含竞态检测
 ```
 
@@ -139,15 +161,34 @@ go test -race ./...      # 含竞态检测
 
 ### 5. 断点续传与崩溃恢复
 
-- 每抓完一页先发布批次（临时文件 + `rename` 原子落盘，`fsync` 后返回），
-  **再**保存下一页的读取位置；位置落盘同样是临时文件 + 原子替换。
-- 进程重启后，记录索引通过**重放全部已发布批次**重建，序号计数器扫描批次文件
-  恢复，所以读到一半崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
-- 下游保存的 `seq` 永远有效：读取时从首个批次文件开始扫描，按变更粒度过滤
-  `seq > after_seq`，文件轮转不影响旧位置。
+- 单个来源一轮的变更随抓随写入暂存文件（不在内存累积），来源读完后才
+  一次性拼装为批次文件（临时文件 + `rename` 原子落盘，`fsync` 后返回），
+  **再**保存下一轮的读取位置；位置落盘同样是临时文件 + 原子替换。
+- 进程重启后，记录索引通过**流式重放全部已发布批次**逐条重建，序号计数器
+  由批次文件名携带的序号区间恢复（旧格式文件则流式扫描），所以读到一半
+  崩溃只会从上一个已确认位置继续，已发布修订不会重复生成变更。
+- 下游保存的 `seq` 永远有效：读取时按变更粒度过滤 `seq > after_seq`，
+  序号区间小于等于位置的批次文件直接跳过，新旧文件布局混排不影响旧位置。
 对应测试：`Test10_InterruptResume`、`Test6_DownstreamReadPosition`。
 
-### 6. 限流隔离与令牌刷新
+### 6. 大积压下的内存有界（同步与恢复各 < 32 MiB）
+
+机构积压再多修订，同步与重启恢复的堆占用也不随积压增长：
+
+- **发布流式化**：变更逐条落暂存文件，提交时按序分配连续 `seq` 区间并
+  流式拼装出最终批次文件；整批可见性由 `rename` 保证，空批次不落盘。
+- **恢复流式化**：信封用 `json.Decoder` 逐变更解码，内存里只有当前一条
+  变更加上按归档键索引的最新状态（键数 = 不同采样数，而非修订数）。
+- **每批次一个文件**：`env-<首seq>-<末seq>-<batchID>.jsonl`，内容仍是
+  单行信封（与旧格式同一形状），文件名即序号索引；旧版 `batches.jsonl`
+  与 `batch-NNNN.jsonl` 由同一流式解析器读取，巨型单行也不再受扫描器
+  行宽限制。
+- 三源并发不变：慢来源还在采集时，其他来源的批次先提交先可见；同一
+  来源的改期两半仍在同一个批次文件里。
+对应测试：`Test12_HeapBoundedSyncAndRecovery`；专项脚本：
+`scripts/verify_memory.sh`（实测同步约 12 MiB、恢复约 4 MiB）。
+
+### 7. 限流隔离与令牌刷新
 
 三个来源在同一轮同步中以独立 goroutine 运行；429 被包装成
 `RateLimitedError`，只让该来源本轮标记为 `rate_limited`，其余两个继续完成。
@@ -157,12 +198,14 @@ go test -race ./...      # 含竞态检测
 
 ## 数据文件格式
 
-`batches/batches.jsonl` 每行一个批次信封：
+每个批次一个文件 `batches/env-<首seq>-<末seq>-<batchID>.jsonl`，内容为单行
+批次信封（与旧版 `batches.jsonl` / `batch-NNNN.jsonl` 中每行的信封完全同
+形状，旧文件照常参与读取与恢复）：
 
 ```json
 {
   "seq": 1,
-  "batch_id": "bravo-1795143282879085674-003",
+  "batch_id": "bravo-1795143282879085674",
   "changed_at": "2026-11-20T02:54:42.879087965Z",
   "changes": [
     {

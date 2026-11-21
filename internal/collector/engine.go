@@ -6,7 +6,7 @@
 //
 //	Batches (JSON Lines) are the authoritative record. The read-position
 //	state file only records where the next run starts. On startup the
-//	per-record index is rebuilt by replaying every published batch, so:
+//	per-record index is rebuilt by streaming every published change, so:
 //	  - an interrupted run simply re-reads from the last saved position;
 //	  - replayed revisions never produce changes twice (revisions are
 //	    monotonic per sample);
@@ -15,6 +15,15 @@
 // A reschedule arrives as adjacent revisions (withdrawal under the old day,
 // insert under the new day). All changes of one source run are published in
 // a single batch, so the withdrawal and the insert become visible together.
+//
+// Memory model
+//
+//	Changes are spilled to disk as they are derived and assembled into the
+//	batch file streaming once the source is fully read; recovery replays
+//	the published files change by change. The heap footprint of a run is
+//	proportional to one page and the number of distinct samples — not to
+//	the size of the revision backlog — so an institution can accumulate
+//	arbitrarily many revisions without breaking sync or restart recovery.
 package collector
 
 import (
@@ -104,25 +113,19 @@ func (e *Engine) SetPageHook(h func(source string, pageNo int, next source.Next)
 func (e *Engine) Syncing() bool { return e.syncing.Load() }
 
 func (e *Engine) rebuildIndex() error {
-	envelopes, err := e.store.ReadAfter(0, 0)
-	if err != nil {
-		return err
-	}
-	for _, env := range envelopes {
-		for _, ch := range env.Changes {
-			key := ch.Institution + "|" + ch.SampleID + "|" + ch.SampledOn
-			switch ch.Op {
-			case domain.OpUpsert:
-				if ch.Record != nil {
-					rec := *ch.Record
-					e.index[key] = &indexEntry{revision: ch.Revision, record: &rec}
-				}
-			case domain.OpWithdraw:
-				e.index[key] = &indexEntry{revision: ch.Revision, withdrawn: true}
+	return e.store.StreamChanges(0, func(ch domain.Change) error {
+		key := ch.Institution + "|" + ch.SampleID + "|" + ch.SampledOn
+		switch ch.Op {
+		case domain.OpUpsert:
+			if ch.Record != nil {
+				rec := *ch.Record
+				e.index[key] = &indexEntry{revision: ch.Revision, record: &rec}
 			}
+		case domain.OpWithdraw:
+			e.index[key] = &indexEntry{revision: ch.Revision, withdrawn: true}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // Materialized returns the currently visible (non-withdrawn) records, sorted
@@ -228,24 +231,42 @@ func (e *Engine) derive(raw map[string]any) (*domain.Change, error) {
 	return ch, nil
 }
 
-// publishAndCheckpoint writes the run's batch and then persists the next
-// read position. The position is only advanced after durable publication.
-func (e *Engine) publishAndCheckpoint(source, batchID string, changes []domain.Change, pos state.Position) (string, error) {
-	if len(changes) > 0 {
-		env, err := e.store.Publish(batchID, changes)
+// spillAdd derives nothing itself; it appends one already-derived change to
+// the run's spill file, creating the batch writer on first use.
+func (e *Engine) spillAdd(bw **store.Writer, src string, ch *domain.Change) error {
+	if ch == nil {
+		return nil
+	}
+	if *bw == nil {
+		w, err := e.store.BeginBatch(e.newBatchID(src))
 		if err != nil {
-			return "", fmt.Errorf("publish batch: %w", err)
+			return err
 		}
-		batchID = env.BatchID
+		*bw = w
 	}
-	if err := e.states.Update(source, pos); err != nil {
-		return "", fmt.Errorf("save position: %w", err)
-	}
-	return batchID, nil
+	return (*bw).Add(*ch)
 }
 
-func (e *Engine) newBatchID(source string, n int) string {
-	return fmt.Sprintf("%s-%d-%03d", source, time.Now().UTC().UnixNano(), n)
+// commitAndCheckpoint publishes the run's spilled batch (if any) and then
+// persists the next read position. The position is only advanced after
+// durable publication.
+func (e *Engine) commitAndCheckpoint(src string, bw *store.Writer, pos state.Position) (batchID string, changes int, err error) {
+	if bw != nil {
+		env, err := bw.Commit()
+		if err != nil {
+			_ = bw.Abort()
+			return "", 0, fmt.Errorf("publish batch: %w", err)
+		}
+		batchID, changes = env.BatchID, bw.Count()
+	}
+	if err := e.states.Update(src, pos); err != nil {
+		return "", 0, fmt.Errorf("save position: %w", err)
+	}
+	return batchID, changes, nil
+}
+
+func (e *Engine) newBatchID(source string) string {
+	return fmt.Sprintf("%s-%d", source, time.Now().UTC().UnixNano())
 }
 
 func classifyError(err error) (string, string) {
@@ -262,16 +283,23 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 	res.Source = mockdata.InstitutionAlpha
 	pos := e.states.Get(mockdata.InstitutionAlpha)
 	offset := pos.Offset
-	var changes []domain.Change
+	var bw *store.Writer
+	abort := func() {
+		if bw != nil {
+			_ = bw.Abort()
+		}
+	}
 	run := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
+			abort()
 			res.Status, res.Error = "interrupted", err.Error()
 			return res
 		}
 		page, err := e.alpha.Fetch(ctx, offset)
 		if err != nil {
+			abort()
 			res.Status, res.Error = classifyError(err)
 			return res
 		}
@@ -280,11 +308,14 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 			res.RecordsSeen++
 			ch, derr := e.derive(raw)
 			if derr != nil {
+				abort()
 				res.Status, res.Error = "failed", derr.Error()
 				return res
 			}
-			if ch != nil {
-				changes = append(changes, *ch)
+			if err := e.spillAdd(&bw, res.Source, ch); err != nil {
+				abort()
+				res.Status, res.Error = "failed", err.Error()
+				return res
 			}
 		}
 		if e.hookAfterPage != nil {
@@ -296,13 +327,12 @@ func (e *Engine) syncAlpha(ctx context.Context) (res SourceResult) {
 			break
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionAlpha, e.newBatchID(mockdata.InstitutionAlpha, run), changes,
-		state.Position{Offset: offset})
+	bid, n, err := e.commitAndCheckpoint(res.Source, bw, state.Position{Offset: offset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = n, bid, "ok"
 	return res
 }
 
@@ -313,11 +343,17 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 	pos := e.states.Get(mockdata.InstitutionBravo)
 	cursor := pos.Cursor
 	cursorOffset := pos.CursorOffset
-	var changes []domain.Change
+	var bw *store.Writer
+	abort := func() {
+		if bw != nil {
+			_ = bw.Abort()
+		}
+	}
 	run := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
+			abort()
 			res.Status, res.Error = "interrupted", err.Error()
 			return res
 		}
@@ -331,6 +367,7 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 				cursor, cursorOffset = "", 0
 				continue
 			}
+			abort()
 			res.Status, res.Error = classifyError(err)
 			return res
 		}
@@ -339,11 +376,14 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 			res.RecordsSeen++
 			ch, derr := e.derive(raw)
 			if derr != nil {
+				abort()
 				res.Status, res.Error = "failed", derr.Error()
 				return res
 			}
-			if ch != nil {
-				changes = append(changes, *ch)
+			if err := e.spillAdd(&bw, res.Source, ch); err != nil {
+				abort()
+				res.Status, res.Error = "failed", err.Error()
+				return res
 			}
 		}
 		if e.hookAfterPage != nil {
@@ -356,13 +396,13 @@ func (e *Engine) syncBravo(ctx context.Context) (res SourceResult) {
 			break
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionBravo, e.newBatchID(mockdata.InstitutionBravo, run), changes,
+	bid, n, err := e.commitAndCheckpoint(res.Source, bw,
 		state.Position{Cursor: cursor, CursorOffset: cursorOffset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = n, bid, "ok"
 	return res
 }
 
@@ -382,18 +422,25 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 		windowIndex = len(windows)
 	}
 	windowOffset := pos.WindowOffset
-	var changes []domain.Change
+	var bw *store.Writer
+	abort := func() {
+		if bw != nil {
+			_ = bw.Abort()
+		}
+	}
 	run := 0
 
 	for windowIndex < len(windows) {
 		window := windows[windowIndex]
 		for {
 			if err := ctx.Err(); err != nil {
+				abort()
 				res.Status, res.Error = "interrupted", err.Error()
 				return res
 			}
 			page, err := e.charlie.FetchWindowPage(ctx, window, windowOffset)
 			if err != nil {
+				abort()
 				res.Status, res.Error = classifyError(err)
 				return res
 			}
@@ -402,11 +449,14 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 				res.RecordsSeen++
 				ch, derr := e.derive(raw)
 				if derr != nil {
+					abort()
 					res.Status, res.Error = "failed", derr.Error()
 					return res
 				}
-				if ch != nil {
-					changes = append(changes, *ch)
+				if err := e.spillAdd(&bw, res.Source, ch); err != nil {
+					abort()
+					res.Status, res.Error = "failed", err.Error()
+					return res
 				}
 			}
 			if e.hookAfterPage != nil {
@@ -421,12 +471,12 @@ func (e *Engine) syncCharlie(ctx context.Context) (res SourceResult) {
 			}
 		}
 	}
-	bid, err := e.publishAndCheckpoint(mockdata.InstitutionCharlie, e.newBatchID(mockdata.InstitutionCharlie, run), changes,
+	bid, n, err := e.commitAndCheckpoint(res.Source, bw,
 		state.Position{WindowIndex: windowIndex, WindowOffset: windowOffset})
 	if err != nil {
 		res.Status, res.Error = "failed", err.Error()
 		return res
 	}
-	res.Changes, res.BatchID, res.Status = len(changes), bid, "ok"
+	res.Changes, res.BatchID, res.Status = n, bid, "ok"
 	return res
 }

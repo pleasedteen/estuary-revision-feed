@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"estuary-collector/internal/collector"
+	"estuary-collector/internal/domain"
 	"estuary-collector/internal/mockdata"
 	"estuary-collector/internal/mockserver"
 	"estuary-collector/internal/service"
@@ -680,6 +683,170 @@ func max(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// liveHeapNow forces a full GC and returns the live heap in bytes.
+func liveHeapNow() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return ms.HeapAlloc
+}
+
+// liveHeapSampler records the live-heap high-water mark of an operation by
+// forcing a GC on a short tick and sampling right after it.
+type liveHeapSampler struct {
+	done chan struct{}
+	peak atomic.Uint64
+}
+
+func startLiveHeapSampler() *liveHeapSampler {
+	s := &liveHeapSampler{done: make(chan struct{})}
+	go func() {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-t.C:
+				if v := liveHeapNow(); v > s.peak.Load() {
+					s.peak.Store(v)
+				}
+			}
+		}
+	}()
+	return s
+}
+
+func (s *liveHeapSampler) stop() uint64 {
+	close(s.done)
+	return s.peak.Load()
+}
+
+// Test12_HeapBoundedSyncAndRecovery generates a ≥64 MiB revision backlog for
+// a small sample set (a few samples revised over and over) and verifies both
+// the sync run and the restart recovery stay within the 32 MiB extra-heap
+// budget, while reschedule atomicity and idempotency are preserved.
+func Test12_HeapBoundedSyncAndRecovery(t *testing.T) {
+	h := newHarness(t)
+	out := h.mockPost("/mock/control/bulk", map[string]any{
+		"source": "alpha", "samples": 8, "revisions": 220000, "page_size": 2500,
+	})
+	if out["rows_appended"].(float64) != 220002 {
+		t.Fatalf("bulk append failed: %v", out)
+	}
+
+	const budget = int64(32 << 20)
+
+	base := liveHeapNow()
+	sampler := startLiveHeapSampler()
+	rep := h.sync()
+	syncExtra := int64(sampler.stop()) - int64(base)
+	for _, r := range rep.Sources {
+		if r.Status != "ok" {
+			t.Fatalf("bulk sync source %s not ok: %+v", r.Source, r)
+		}
+	}
+	if got := sourceResult(rep, mockdata.InstitutionAlpha).Changes; got != 8+220002 {
+		t.Fatalf("alpha changes = %d, want %d", got, 8+220002)
+	}
+	t.Logf("sync extra heap peak: %.1f MiB (budget 32 MiB)", float64(syncExtra)/float64(int64(1)<<20))
+	if syncExtra > budget {
+		t.Fatalf("sync extra heap peak %d bytes exceeds budget %d", syncExtra, budget)
+	}
+
+	// The backlog was published as at least 64 MiB of changes.
+	var published int64
+	entries, err := os.ReadDir(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		published += info.Size()
+	}
+	t.Logf("published batches: %.1f MiB", float64(published)/float64(int64(1)<<20))
+	if published < 64<<20 {
+		t.Fatalf("published %d bytes of changes, want >= 64 MiB", published)
+	}
+
+	// The reschedule of BULK-000 stayed atomic: both halves in one envelope.
+	st, err := store.Open(filepath.Join(h.dir, "batches"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomicReschedule := false
+	err = st.StreamEnvelopes(func(_ store.EnvelopeHeader, next func(*domain.Change) bool) error {
+		var withdrawn, inserted bool
+		var c domain.Change
+		for next(&c) {
+			if c.SampleID != "BULK-000" {
+				continue
+			}
+			if c.Op == domain.OpWithdraw && c.SampledOn == "2026-11-10" {
+				withdrawn = true
+			}
+			if c.Op == domain.OpUpsert && c.SampledOn == "2026-11-12" {
+				inserted = true
+			}
+		}
+		if withdrawn && inserted {
+			atomicReschedule = true
+			return store.StopWalk()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !atomicReschedule {
+		t.Fatal("BULK-000 reschedule halves not published in the same envelope")
+	}
+
+	// Restart recovery from the published data, measured the same way.
+	base2 := liveHeapNow()
+	sampler2 := startLiveHeapSampler()
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	recExtra := int64(sampler2.stop()) - int64(base2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	t.Logf("recovery extra heap peak: %.1f MiB (budget 32 MiB)", float64(recExtra)/float64(int64(1)<<20))
+	if recExtra > budget {
+		t.Fatalf("recovery extra heap peak %d bytes exceeds budget %d", recExtra, budget)
+	}
+
+	// The rebuilt index makes a re-run a no-op and keeps the rescheduled
+	// record visible under its new archive day.
+	rep = h.sync()
+	for _, r := range rep.Sources {
+		if r.Status != "ok" || r.Changes != 0 {
+			t.Fatalf("post-recovery rerun not an empty ok run: %+v", r)
+		}
+	}
+	recs := materializedMap(h)
+	if _, ok := recs["alpha|BULK-000|2026-11-12"]; !ok {
+		t.Fatal("rescheduled BULK-000 not visible after recovery")
+	}
+	if len(recs) != 22+8 {
+		t.Fatalf("expected 30 materialized records after recovery, got %d", len(recs))
+	}
 }
 
 // TestHTTPLayer exercises the real HTTP mux including conflict and

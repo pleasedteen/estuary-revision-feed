@@ -10,6 +10,7 @@ import (
 
 	"estuary-collector/internal/auth"
 	"estuary-collector/internal/collector"
+	"estuary-collector/internal/memstats"
 	"estuary-collector/internal/mockserver"
 	"estuary-collector/internal/source"
 	"estuary-collector/internal/state"
@@ -30,11 +31,15 @@ type Config struct {
 type Service struct {
 	Engine *collector.Engine
 	batch  *store.Store
+	mem    *memstats.Sampler
 	server *http.Server
 }
 
-// New builds stores, token managers, source clients and the engine.
+// New builds stores, token managers, source clients and the engine. The heap
+// sampler starts first so that index recovery — which runs inside this
+// constructor — is covered by the since-start high-water mark.
 func New(cfg Config) (*Service, error) {
+	mem := memstats.Start(time.Millisecond)
 	batch, err := store.Open(cfg.DataDir + "/batches")
 	if err != nil {
 		return nil, err
@@ -52,7 +57,7 @@ func New(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{Engine: engine, batch: batch}, nil
+	return &Service{Engine: engine, batch: batch, mem: mem}, nil
 }
 
 // Handler returns the HTTP mux.
@@ -62,6 +67,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/v1/batches", s.handleBatches)
 	mux.HandleFunc("/v1/records", s.handleRecords)
 	mux.HandleFunc("/v1/status", s.handleStatus)
+	mux.HandleFunc("/debug/mem", s.handleMem)
+	mux.HandleFunc("/debug/mem/reset", s.handleMemReset)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -156,6 +163,33 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"syncing":     s.Engine.Syncing(),
 		"max_seq":     s.batch.MaxSeq(),
 		"server_time": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// handleMem reports the Go heap high-water marks. peak_since_start covers
+// restart recovery (which runs before the HTTP surface); peak_since_reset
+// covers whatever happened since the last POST /debug/mem/reset.
+func (s *Service) handleMem(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"heap_alloc":       s.mem.Current(),
+		"peak_since_start": s.mem.Peak(),
+		"peak_since_reset": s.mem.PeakSinceReset(),
+	})
+}
+
+// handleMemReset settles the heap with a GC and restarts the resettable
+// high-water mark, returning the steady-state baseline in bytes.
+func (s *Service) handleMemReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"heap_alloc": s.mem.Reset(),
 	})
 }
 

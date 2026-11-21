@@ -9,6 +9,7 @@
 package mockdata
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -115,6 +116,36 @@ func (p *Provider) Advance() int {
 	}
 	p.stage++
 	return p.stage
+}
+
+// AppendBulkRevisions appends a deterministic revision backlog to the alpha
+// stream: a small synthetic sample set ("BULK-000"..) revised over and over,
+// modeling an institution that accumulated a large backlog while the
+// collector was away. The final two rows are a reschedule of the first
+// sample (old-day withdrawal followed by new-day insert), so the atomic
+// reschedule guarantee is exercised under backlog conditions too. It returns
+// the number of rows appended.
+func (p *Provider) AppendBulkRevisions(samples, revisions int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	const day = "2026-11-10"
+	for i := 0; i < revisions; i++ {
+		s := i % samples
+		rev := int64(i/samples + 1)
+		id := "BULK-" + fmt.Sprintf("%03d", s)
+		mg := fmt.Sprintf("%d.%d", 5+(int(rev)*7+s)%40, (int(rev)*13+s)%10)
+		published := fmt.Sprintf("2026-11-15T%02d:%02d:%02dZ", i/3600%24, i/60%60, i%60)
+		p.alpha = append(p.alpha,
+			newRow("alpha", id, rev, day, "积压点-"+id, "悬浮物", mg, "mg/L", "active", published))
+	}
+	// Reschedule of BULK-000 from 2026-11-10 to 2026-11-12: the two halves
+	// are adjacent revisions and must leave in the same batch.
+	lastRev := int64((revisions-1)/samples + 1)
+	p.alpha = append(p.alpha,
+		newRow("alpha", "BULK-000", lastRev+1, day, "积压点-BULK-000", "悬浮物", "9.9", "mg/L", "withdrawn", "2026-11-16T00:00:00Z"),
+		newRow("alpha", "BULK-000", lastRev+2, "2026-11-12", "积压点-BULK-000", "悬浮物", "9.9", "mg/L", "active", "2026-11-16T00:00:01Z"),
+	)
+	return revisions + 2
 }
 
 // AlphaLen returns the current length of the alpha change stream.

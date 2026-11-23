@@ -17,11 +17,21 @@ import (
 type Position struct {
 	// Offset source (alpha): next row offset in the change stream.
 	Offset int `json:"offset,omitempty"`
-	// Cursor source (bravo): opaque cursor of the next page; empty means
-	// "start from head".
+	// Cursor source (bravo): cursor of the next page to fetch. Empty means
+	// either "nothing confirmed yet, start from the head" or "the last run
+	// reached the tail" — in the latter case ResumeCursor below carries the
+	// re-entry point. The end of the log never returns a successor cursor, so
+	// a tail bookmark always has an empty Cursor.
 	Cursor string `json:"cursor,omitempty"`
-	// Cursor source: last seen log offset, used for stats only.
+	// Cursor source: log offset accompanying Cursor, used for stats only.
 	CursorOffset int `json:"cursor_offset,omitempty"`
+	// ResumeCursor re-fetches the last confirmed bravo page (the page behind
+	// Cursor). It survives across rounds and restarts, so catching up after a
+	// tail bookmark costs at most one re-read of the previous final page.
+	// Empty means there is no confirmed page yet (head restart / fresh state).
+	ResumeCursor string `json:"resume_cursor,omitempty"`
+	// ResumeOffset is the log offset of the page fetched with ResumeCursor.
+	ResumeOffset int `json:"resume_offset,omitempty"`
 	// Window source (charlie): index of the current upload window...
 	WindowIndex int `json:"window_index,omitempty"`
 	// ...and the next row offset inside that window.

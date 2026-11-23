@@ -389,7 +389,11 @@ func Test6_DownstreamReadPosition(t *testing.T) {
 
 // Test7_CursorExpiryReplay verifies an expired bravo cursor restarts from
 // the head, replays old revisions without duplicate changes, and that an
-// old revision cannot resurrect a withdrawn record.
+// old revision cannot resurrect a withdrawn record. It also checks the new
+// resume semantics: a valid continuation cursor resumes after the last
+// confirmed page (across rounds and restarts), normal catch-up re-reads at
+// most the previous final page, and one round never exceeds the detail
+// request budget.
 func Test7_CursorExpiryReplay(t *testing.T) {
 	h := newHarness(t)
 	// Capture a mid-log bravo cursor during the initial synchronization; the
@@ -408,19 +412,33 @@ func Test7_CursorExpiryReplay(t *testing.T) {
 		t.Fatal("expected to observe a non-empty bravo cursor while paging")
 	}
 
-	// Stage 1 withdraws B-201; stage 2 re-publishes its stale rev1 (active).
+	// Stage 1 withdraws B-201.
 	h.advanceStage()
 	rep := h.sync()
 	if r := sourceResult(rep, mockdata.InstitutionBravo); r.Status != "ok" {
 		t.Fatalf("bravo stage1: %+v", r)
 	}
-	// Force the persisted position back to the captured mid-log cursor and
-	// mark it expired, then advance to stage 2.
-	posStore, err := state.Open(filepath.Join(h.dir, "state"))
-	if err != nil {
-		t.Fatal(err)
+
+	// Tail bookmark must carry an empty next cursor plus a resume cursor that
+	// re-enters the last confirmed page, persisted for cross-round resume.
+	saved := loadState(t, h.dir)["bravo"]
+	if saved.Cursor != "" {
+		t.Fatalf("tail bookmark must keep an empty next cursor, got %q", saved.Cursor)
 	}
-	if err := posStore.Update(mockdata.InstitutionBravo,
+	if saved.ResumeCursor == "" {
+		t.Fatal("tail bookmark must persist a resume cursor for the last confirmed page")
+	}
+
+	// Normal catch-up re-reads at most the previous final page: with no new
+	// rows, a further round needs exactly one detail request and emits nothing.
+	rep = h.sync()
+	if r := sourceResult(rep, mockdata.InstitutionBravo); r.Status != "ok" || r.Changes != 0 || r.PagesFetched != 1 {
+		t.Fatalf("tail catch-up should re-read only the final page, got %+v", r)
+	}
+
+	// Inject the captured mid-log continuation cursor directly into the
+	// engine's cached position and mark that cursor expired in the mock.
+	if err := h.svc.Engine.OverridePositionForTest(mockdata.InstitutionBravo,
 		state.Position{Cursor: seenCursor, CursorOffset: seenOffset}); err != nil {
 		t.Fatal(err)
 	}
@@ -438,6 +456,10 @@ func Test7_CursorExpiryReplay(t *testing.T) {
 	if !br.CursorRestart {
 		t.Fatal("expected a cursor restart to be reported")
 	}
+	// The head replay must stay inside the per-round detail budget.
+	if br.PagesFetched > 6 {
+		t.Fatalf("head replay exceeded the 6 detail-request budget: %d", br.PagesFetched)
+	}
 	// Only the fresh B-200 revision is a change; every replayed old revision
 	// (including the stale active B-201 rev1) is absorbed.
 	if br.Changes != 1 {
@@ -449,6 +471,25 @@ func Test7_CursorExpiryReplay(t *testing.T) {
 	}
 	if recs["bravo|B-200|2026-11-10"]["revision"].(float64) != 2 {
 		t.Fatalf("B-200 should be at revision 2: %v", recs["bravo|B-200|2026-11-10"])
+	}
+
+	// Restart the process: the persisted tail bookmark must keep resuming from
+	// the last confirmed page rather than re-reading the whole log.
+	svc2, err := service.New(service.Config{
+		DataDir:      h.dir,
+		MockBaseURL:  h.mockURL,
+		AuthURL:      h.mockURL + "/auth/token",
+		ClientID:     mockserver.SharedClient,
+		RefreshToken: "refresh-token-v1",
+		BravoToken:   "bravo-static-token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.svc = svc2
+	rep = h.sync()
+	if r := sourceResult(rep, mockdata.InstitutionBravo); r.Status != "ok" || r.PagesFetched != 1 {
+		t.Fatalf("post-restart catch-up should use the persisted resume cursor, got %+v", r)
 	}
 }
 

@@ -20,6 +20,14 @@ func TestUpdateAndReopen(t *testing.T) {
 	if err := st.Update("bravo", Position{Cursor: "abc", CursorOffset: 4}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.Update("bravo-tail", Position{
+		Cursor:       "", // tail bookmarks never carry a successor cursor
+		CursorOffset: 13,
+		ResumeCursor: "resume-token",
+		ResumeOffset: 12,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	st2, err := Open(filepath.Join(dir))
 	if err != nil {
@@ -30,5 +38,9 @@ func TestUpdateAndReopen(t *testing.T) {
 	}
 	if got := st2.Get("bravo"); got.Cursor != "abc" || got.CursorOffset != 4 {
 		t.Fatalf("bravo position lost: %+v", got)
+	}
+	tail := st2.Get("bravo-tail")
+	if tail.Cursor != "" || tail.ResumeCursor != "resume-token" || tail.ResumeOffset != 12 {
+		t.Fatalf("bravo tail bookmark (resume cursor) lost across reopen: %+v", tail)
 	}
 }

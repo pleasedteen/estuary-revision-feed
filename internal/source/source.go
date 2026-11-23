@@ -2,8 +2,10 @@
 // three pagination styles:
 //
 //   - alpha:   offset pagination, short-lived shared token
-//   - bravo:   opaque cursor pagination; an expired cursor forces a head
-//     restart that may replay already-seen old revisions
+//   - bravo:   opaque cursor pagination; the last page returns no successor
+//     cursor, so the collector persists a resume cursor for the last confirmed
+//     page. An expired continuation cursor (HTTP 410) triggers a bounded head
+//     readback, never an unbounded restart loop.
 //   - charlie: upload-time windows, each window itself multi-page
 //
 // HTTP 401 transparently refreshes the shared token (at most once per token
@@ -51,14 +53,14 @@ func (e *RateLimitedError) Error() string {
 	return fmt.Sprintf("%s rate limited (retry after %s)", e.Source, e.RetryAfter)
 }
 
-// CursorExpiredError wraps bravo's HTTP 410: the stored cursor is dead and
-// the log must be re-read from the head.
+// CursorExpiredError wraps bravo's HTTP 410: the continuation cursor is dead
+// and the collector falls back to a bounded readback from the log head.
 type CursorExpiredError struct {
 	Source string
 }
 
 func (e *CursorExpiredError) Error() string {
-	return e.Source + " cursor expired, restarting from head"
+	return e.Source + " cursor expired, reading back from the head"
 }
 
 // HTTPDoer is the minimal http client surface.

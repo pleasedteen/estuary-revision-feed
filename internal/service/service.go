@@ -10,6 +10,7 @@ import (
 
 	"estuary-collector/internal/auth"
 	"estuary-collector/internal/collector"
+	"estuary-collector/internal/journal"
 	"estuary-collector/internal/mockserver"
 	"estuary-collector/internal/source"
 	"estuary-collector/internal/state"
@@ -43,12 +44,16 @@ func New(cfg Config) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
+	runs, err := journal.Open(cfg.DataDir + "/state")
+	if err != nil {
+		return nil, err
+	}
 	tokens := auth.NewManager(cfg.AuthURL, cfg.ClientID, cfg.RefreshToken)
 	alpha := source.NewAlpha(cfg.MockBaseURL, tokens)
 	bravo := source.NewBravo(cfg.MockBaseURL, cfg.BravoToken)
 	charlie := source.NewCharlie(cfg.MockBaseURL, tokens)
 
-	engine, err := collector.New(batch, states, alpha, bravo, charlie)
+	engine, err := collector.New(batch, states, runs, alpha, bravo, charlie)
 	if err != nil {
 		return nil, err
 	}
@@ -59,6 +64,7 @@ func New(cfg Config) (*Service, error) {
 func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/sync", s.handleSync)
+	mux.HandleFunc("/v1/sync/runs", s.handleSyncRuns)
 	mux.HandleFunc("/v1/batches", s.handleBatches)
 	mux.HandleFunc("/v1/records", s.handleRecords)
 	mux.HandleFunc("/v1/status", s.handleStatus)
@@ -103,6 +109,40 @@ func (s *Service) handleSync(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, status, report)
+}
+
+// handleSyncRuns reports per-round, per-source sync progress from the run
+// journal: pages fetched, current/failure stage, published batch and resume
+// position save state. It answers from the journal alone — it never scans
+// the batch files and never blocks on a stuck source.
+func (s *Service) handleSyncRuns(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET required")
+		return
+	}
+	if q := r.URL.Query().Get("round"); q != "" {
+		n, err := strconv.ParseInt(q, 10, 64)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "bad round number")
+			return
+		}
+		run, ok := s.Engine.Run(n)
+		if !ok {
+			writeError(w, http.StatusNotFound, "round not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"syncing": s.Engine.Syncing(),
+			"run":     run,
+		})
+		return
+	}
+	current, runs := s.Engine.Runs()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"syncing":       s.Engine.Syncing(),
+		"current_round": current,
+		"runs":          runs,
+	})
 }
 
 func (s *Service) handleBatches(w http.ResponseWriter, r *http.Request) {

@@ -38,6 +38,13 @@ type Server struct {
 	clients map[string]*clientAuth
 	// rateLimited marks sources currently answering 429.
 	rateLimited map[string]bool
+	// pageGates allows a source a fixed number of further requests before
+	// it starts answering 429, modeling a quota that kicks in mid-run
+	// (e.g. "rate limited from the second page on").
+	pageGates map[string]int64
+	// hangs holds release channels for sources whose requests must block
+	// until the hang is lifted, modeling a stuck institution.
+	hangs map[string]chan struct{}
 	// invalidCursors holds cursor values that must be treated as expired.
 	invalidCursors map[string]bool
 	requestCounts  map[string]*atomic.Int64
@@ -49,6 +56,8 @@ func New() *Server {
 		Provider:       mockdata.NewProvider(),
 		clients:        map[string]*clientAuth{},
 		rateLimited:    map[string]bool{},
+		pageGates:      map[string]int64{},
+		hangs:          map[string]chan struct{}{},
 		invalidCursors: map[string]bool{},
 		requestCounts:  map[string]*atomic.Int64{},
 	}
@@ -70,6 +79,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/auth/token", s.handleToken)
 	mux.HandleFunc("/mock/control/stage", s.handleStage)
 	mux.HandleFunc("/mock/control/ratelimit", s.handleRateLimit)
+	mux.HandleFunc("/mock/control/ratelimit_page", s.handleRateLimitPage)
+	mux.HandleFunc("/mock/control/hang", s.handleHang)
 	mux.HandleFunc("/mock/control/cursor/expire", s.handleCursorExpire)
 	mux.HandleFunc("/mock/control/reset", s.handleReset)
 	mux.HandleFunc("/mock/stats", s.handleStats)
@@ -138,7 +149,8 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requireSharedAuth(source string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s.requestCounts[source].Add(1)
-		if s.isRateLimited(source) {
+		s.waitHang(source)
+		if s.isRateLimited(source) || s.gatePage(source) {
 			w.Header().Set("Retry-After", "2")
 			writeError(w, http.StatusTooManyRequests, source+" is rate limited")
 			return
@@ -184,7 +196,8 @@ func (s *Server) handleAlpha(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleBravo(w http.ResponseWriter, r *http.Request) {
 	s.requestCounts[mockdata.InstitutionBravo].Add(1)
-	if s.isRateLimited(mockdata.InstitutionBravo) {
+	s.waitHang(mockdata.InstitutionBravo)
+	if s.isRateLimited(mockdata.InstitutionBravo) || s.gatePage(mockdata.InstitutionBravo) {
 		w.Header().Set("Retry-After", "2")
 		writeError(w, http.StatusTooManyRequests, "bravo is rate limited")
 		return
@@ -273,6 +286,48 @@ func (s *Server) handleRateLimit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"source": source, "rate_limited": on})
 }
 
+// handleRateLimitPage arms a per-source page quota: the source answers the
+// next "after" requests normally and every further request with 429, so a
+// run can be throttled starting exactly at its second page. after=-1 lifts
+// the gate.
+func (s *Server) handleRateLimitPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	source := r.URL.Query().Get("source")
+	after := atoiDefault(r.URL.Query().Get("after"), -1)
+	s.mu.Lock()
+	if after < 0 {
+		delete(s.pageGates, source)
+	} else {
+		s.pageGates[source] = int64(after)
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"source": source, "pages_before_429": after})
+}
+
+// handleHang blocks ("on") or releases ("off") every request of a source,
+// modeling an institution that stops answering mid-run.
+func (s *Server) handleHang(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	source := r.URL.Query().Get("source")
+	on := r.URL.Query().Get("on") != "false"
+	s.mu.Lock()
+	if ch, ok := s.hangs[source]; ok {
+		close(ch)
+		delete(s.hangs, source)
+	}
+	if on {
+		s.hangs[source] = make(chan struct{})
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"source": source, "hanging": on})
+}
+
 func (s *Server) handleCursorExpire(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
@@ -299,6 +354,11 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.Provider.Reset()
 	s.mu.Lock()
 	s.rateLimited = map[string]bool{}
+	s.pageGates = map[string]int64{}
+	for src, ch := range s.hangs {
+		close(ch)
+		delete(s.hangs, src)
+	}
 	s.invalidCursors = map[string]bool{}
 	for _, c := range s.requestCounts {
 		c.Store(0)
@@ -319,11 +379,21 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	for k, v := range s.rateLimited {
 		rl[k] = v
 	}
+	gates := map[string]int64{}
+	for k, v := range s.pageGates {
+		gates[k] = v
+	}
+	hanging := []string{}
+	for k := range s.hangs {
+		hanging = append(hanging, k)
+	}
 	c := s.clients[SharedClient]
 	c.mu.Lock()
 	stats := map[string]any{
 		"stage":            s.Provider.Stage(),
 		"rate_limited":     rl,
+		"page_gates":       gates,
+		"hanging":          hanging,
 		"token_generation": c.generation,
 		"refresh_count":    c.refreshCount,
 	}
@@ -343,6 +413,32 @@ func (s *Server) isRateLimited(source string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.rateLimited[source]
+}
+
+// gatePage reports whether a request must be throttled under the source's
+// page quota, consuming one allowed page when the quota is not yet exhausted.
+func (s *Server) gatePage(source string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	left, ok := s.pageGates[source]
+	if !ok {
+		return false
+	}
+	if left > 0 {
+		s.pageGates[source] = left - 1
+		return false
+	}
+	return true
+}
+
+// waitHang blocks while the source is marked as hanging.
+func (s *Server) waitHang(source string) {
+	s.mu.RLock()
+	ch, ok := s.hangs[source]
+	s.mu.RUnlock()
+	if ok {
+		<-ch
+	}
 }
 
 // consumeCursorInvalid reports whether a cursor is expired and clears the
